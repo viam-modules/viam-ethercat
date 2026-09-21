@@ -104,6 +104,13 @@ matter:
   `get_motor_voltage`, `get_motor_current_actual_value`,
   `get_motor_drive_modes`.
 
+## Third-party code
+
+The CSP trajectory generator is built on a vendored, lightly modified copy of WPILib's
+`TrapezoidProfile` (BSD 3-Clause), kept apart from project code in `src/third_party/wpilib/`
+with its own license file. See `THIRD_PARTY_NOTICES.md` for that and for the build-time
+dependencies (SOEM, Viam C++ SDK).
+
 ## Building
 
 Local development build (CMake + FetchContent, clang or gcc ≥ 13):
