@@ -17,17 +17,6 @@
 
 namespace ethercat::servo {
 
-// The CiA402 command intent for a single motor API call. PP = Profile Position (GoTo/GoFor); PV =
-// Profile Velocity (SetRPM). Not a config choice: the driver is always switch-capable and each API
-// call ensures its own required mode at runtime. Used internally as the per-command mode; never
-// parsed from config.
-enum class ControlMode : std::uint8_t {
-    ProfilePosition,
-    ProfileVelocity,
-};
-
-const char* to_string(ControlMode mode) noexcept;
-
 struct ServoConfig {
     // --- identity / bus ---
     std::string ifname;          // EtherCAT NIC
