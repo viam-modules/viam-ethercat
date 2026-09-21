@@ -182,6 +182,7 @@ target_sources(ethercat
     src/ethercat/cia402.cpp
     src/ethercat/pdo_cache.cpp
     src/ethercat/pdo_mapping.cpp
+    src/ethercat/log.cpp
     src/ethercat/master.cpp
     src/ethercat/realtime.cpp
     src/ethercat/runner.cpp
@@ -318,6 +319,7 @@ function(viam_add_test test_name source)
 endfunction()
 
 viam_add_test(pdo_buffer_test tests/pdo_buffer_test.cpp)
+viam_add_test(log_test tests/log_test.cpp)
 viam_add_test(cia402_test tests/cia402_test.cpp)
 viam_add_test(pdo_cache_test tests/pdo_cache_test.cpp)
 viam_add_test(soem_backend_test tests/soem_backend_test.cpp)

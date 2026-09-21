@@ -3,12 +3,13 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
-#include <iostream>
+#include <format>
 #include <string>
 
 #include <soem/soem.h>
 
 #include "ethercat/errors.hpp"
+#include "ethercat/log.hpp"
 #include "ethercat/util.hpp"
 
 namespace ethercat {
@@ -63,18 +64,44 @@ EcatState from_soem_state(std::uint16_t soem) noexcept {
     }
 }
 
-// Drain SOEM's error stack and, if a CoE abort is present, return its detail.
-// SOEM reports an SDO abort by pushing an ec_errort (with .AbortCode) even when
-// the mailbox working counter is non-zero, so checking the WKC alone can miss it.
-std::string pop_coe_abort(ecx_contextt* ctx) {
-    std::string detail;
+// How an SDO transfer ended. SOEM returns working counter 0 both when the slave never answered
+// and when it answered with a CoE abort (the abort code is pushed on the error stack), so drain
+// the stack to tell a dead mailbox from a refused value.
+struct SdoOutcome {
+    bool aborted = false;          // the drive answered with an abort frame
+    std::uint32_t abort_code = 0;  // its CoE abort code (0x06090030 = value range exceeded, ...)
+    std::string other;             // any non-abort SOEM error entries (packet/mailbox errors)
+};
+
+SdoOutcome drain_sdo_errors(ecx_contextt* ctx) {
+    SdoOutcome out;
     ec_errort err{};
     while (ecx_poperror(ctx, &err)) {
         if (err.Etype == EC_ERR_TYPE_SDO_ERROR) {
-            detail = ", CoE abort " + hex(static_cast<std::uint32_t>(err.AbortCode));
+            out.aborted = true;
+            out.abort_code = static_cast<std::uint32_t>(err.AbortCode);
+        } else {
+            out.other += std::format(" [soem error type {}]", static_cast<int>(err.Etype));
         }
     }
-    return detail;
+    return out;
+}
+
+// One failure line naming the object, the payload size and the kind of failure.
+std::string describe_sdo_failure(
+    const char* op, std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::size_t bytes, int wkc, const SdoOutcome& o) {
+    std::string msg = std::format("SDO {} slave {} object 0x{:04X}:{:02X} ({} B) failed", op, slave, index, sub, bytes);
+    if (o.aborted) {
+        msg += std::format(
+            " -- the drive answered with CoE abort 0x{:08X} ({}); the request reached the drive and it refused it"
+            " (working counter {} is SOEM's abort convention, not a missing reply)",
+            o.abort_code,
+            ec_sdoerror2string(o.abort_code),
+            wkc);
+    } else {
+        msg += std::format(" -- no reply (working counter {}): the CoE mailbox did not answer{}", wkc, o.other);
+    }
+    return msg;
 }
 
 }  // namespace
@@ -111,6 +138,7 @@ std::size_t SoemBackend::open(std::string_view ifname) {
         throw Error("no EtherCAT slaves found on '" + name + "' (is the bus wired and powered?)");
     }
     impl_->slave_count = count;
+    ETHERCAT_LOG_INFO("open", "'{}': enumerated {} slave(s)", name, count);
 
     // Confirm PRE-OP. config_init leaves slaves nominally in PRE-OP; manualstatechange=1 makes
     // this code own every AL transition (so config_map_group does not auto-jump to SAFE-OP and
@@ -141,6 +169,24 @@ std::size_t SoemBackend::open(std::string_view ifname) {
     // so with a stale INIT it takes neither the cyclic nor the direct path and returns 0 without
     // transmitting. ec_sample calls ecx_readstate after reaching PRE-OP for the same reason.
     ecx_readstate(&impl_->ctx);
+    for (int i = 1; i <= count; ++i) {
+        const ec_slavet& s = impl_->ctx.slavelist[i];
+        ETHERCAT_LOG_INFO("open",
+                          "slave {}: '{}' vendor 0x{:08X} product 0x{:08X} rev 0x{:08X} state {} AL 0x{:04X} mailbox out/in {}/{} B"
+                          " default Obytes {} Ibytes {} hasdc {}",
+                          i,
+                          s.name,
+                          s.eep_man,
+                          s.eep_id,
+                          s.eep_rev,
+                          to_string(from_soem_state(s.state)),
+                          s.ALstatuscode,
+                          s.mbx_l,
+                          s.mbx_rl,
+                          s.Obytes,
+                          s.Ibytes,
+                          s.hasdc ? "yes" : "no");
+    }
 
     // CoE mailbox readiness gate (two parts, per CoE-capable slave). Workaround for drives whose
     // CoE mailbox is slow to ready after the PRE-OP transition (the same drives whose SAFE-OP->OP
@@ -182,6 +228,11 @@ std::size_t SoemBackend::open(std::string_view ifname) {
             int psize = static_cast<int>(sizeof(vendor));
             warm_wkc = ecx_SDOread(&impl_->ctx, slave, 0x1018, 0x01, FALSE, &psize, &vendor, kWarmupTimeoutUs);
             if (warm_wkc > 0) {
+                ETHERCAT_LOG_DEBUG("open",
+                                   "slave {}: CoE mailbox answered warm-up read 0x1018:01 on attempt {} (vendor 0x{:08X})",
+                                   i,
+                                   attempt + 1,
+                                   vendor);
                 break;
             }
             (void)osal_usleep(kWarmupGapUs);
@@ -236,16 +287,19 @@ void SoemBackend::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8
                     std::to_string(impl_->slave_count) + ")");
     }
     const int size = static_cast<int>(data.size());
+    ETHERCAT_LOG_DEBUG("sdo", "write slave {} 0x{:04X}:{:02X} <- {} B [{}]", slave, index, sub, data.size(), log::hex_bytes(data));
     const int wkc = ecx_SDOwrite(&impl_->ctx, slave, index, sub, FALSE, size, data.data(), EC_TIMEOUTRXM);
     // A CoE abort can return wkc > 0 but push an error, so check both. This is the generic SDO
     // tier, so it throws SdoError (carrying the abort code), not PdoMappingError. apply_pdo_map
     // wraps its mapping-object writes (0x1C1x/0x16xx/0x1Axx) to surface PdoMappingError where that
     // name is correct; a non-mapping abort (mode 0x6060, vendor/tuning, fault-reset) stays SdoError.
     if (wkc <= 0 || ecx_iserror(&impl_->ctx)) {
-        const std::string abort = pop_coe_abort(&impl_->ctx);
-        throw SdoError("SDO write to slave " + std::to_string(slave) + " object " + std::to_string(index) + ":" + std::to_string(sub) +
-                       " failed (working counter " + std::to_string(wkc) + ")" + abort);
+        const SdoOutcome outcome = drain_sdo_errors(&impl_->ctx);
+        const std::string msg = describe_sdo_failure("write to", slave, index, sub, data.size(), wkc, outcome);
+        ETHERCAT_LOG_DEBUG("sdo", "{}", msg);  // the thrown SdoError carries the text
+        throw SdoError(msg);
     }
+    ETHERCAT_LOG_DEBUG("sdo", "write slave {} 0x{:04X}:{:02X} ok (wkc {})", slave, index, sub, wkc);
 }
 
 std::size_t SoemBackend::sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out) {
@@ -254,13 +308,24 @@ std::size_t SoemBackend::sdo_read(std::uint16_t slave, std::uint16_t index, std:
                     std::to_string(impl_->slave_count) + ")");
     }
     int size = static_cast<int>(out.size());
+    ETHERCAT_LOG_DEBUG("sdo", "read slave {} 0x{:04X}:{:02X} (up to {} B)", slave, index, sub, out.size());
     const int wkc = ecx_SDOread(&impl_->ctx, slave, index, sub, FALSE, &size, out.data(), EC_TIMEOUTRXM);
     if (wkc <= 0 || ecx_iserror(&impl_->ctx)) {
-        const std::string abort = pop_coe_abort(&impl_->ctx);
-        throw Error("SDO read from slave " + std::to_string(slave) + " object " + std::to_string(index) + ":" + std::to_string(sub) +
-                    " failed (working counter " + std::to_string(wkc) + ")" + abort);
+        const SdoOutcome outcome = drain_sdo_errors(&impl_->ctx);
+        const std::string msg = describe_sdo_failure("read from", slave, index, sub, out.size(), wkc, outcome);
+        ETHERCAT_LOG_DEBUG("sdo", "{}", msg);  // the thrown SdoError carries the text
+        throw Error(msg);
     }
-    return static_cast<std::size_t>(size < 0 ? 0 : size);
+    const std::size_t got = static_cast<std::size_t>(size < 0 ? 0 : size);
+    ETHERCAT_LOG_DEBUG("sdo",
+                       "read slave {} 0x{:04X}:{:02X} -> {} B [{}] (wkc {})",
+                       slave,
+                       index,
+                       sub,
+                       got,
+                       log::hex_bytes(out.first(std::min(got, out.size()))),
+                       wkc);
+    return got;
 }
 
 void SoemBackend::map_process_data() {
@@ -271,6 +336,22 @@ void SoemBackend::map_process_data() {
     }
     const ec_groupt& g = impl_->ctx.grouplist[0];
     impl_->expected_wkc = (g.outputsWKC * 2) + g.inputsWKC;
+    ETHERCAT_LOG_DEBUG("map",
+                       "process image mapped: {} B IOmap, expected WKC {} (outputs {} x2 + inputs {})",
+                       used,
+                       impl_->expected_wkc,
+                       g.outputsWKC,
+                       g.inputsWKC);
+    for (int i = 1; i <= impl_->slave_count; ++i) {
+        const ec_slavet& s = impl_->ctx.slavelist[i];
+        ETHERCAT_LOG_DEBUG("map",
+                           "slave {}: Obytes {} (Rx command) Ibytes {} (Tx feedback) state {} AL 0x{:04X}",
+                           i,
+                           s.Obytes,
+                           s.Ibytes,
+                           to_string(from_soem_state(s.state)),
+                           s.ALstatuscode);
+    }
 }
 
 void SoemBackend::request_state(std::uint16_t slave, EcatState target) {
@@ -282,9 +363,12 @@ void SoemBackend::request_state(std::uint16_t slave, EcatState target) {
 
     const std::uint16_t want = to_soem_state(target);
     impl_->ctx.slavelist[slave].state = want;
+    ETHERCAT_LOG_DEBUG("state", "requesting {} for slave {} ({} = all)", to_string(target), slave, 0);
     ecx_writestate(&impl_->ctx, slave);
 
     const std::uint16_t reached = ecx_statecheck(&impl_->ctx, slave, want, EC_TIMEOUTSTATE);
+    ETHERCAT_LOG_DEBUG(
+        "state", "slave {} -> {}: reached {} (raw 0x{:04X})", slave, to_string(target), to_string(from_soem_state(reached)), reached);
     if (reached != want) {
         // Refresh every slave's AL state and AL status code so the error names why (e.g.
         // "Invalid DC SYNC Configuration", "SM watchdog"); a SAFE-OP->OP refusal is otherwise
@@ -334,6 +418,23 @@ void SoemBackend::reack_op(std::uint16_t slave) noexcept {
     }
 }
 
+EcatState SoemBackend::refresh_slave_state(std::uint16_t slave) {
+    if (!impl_->is_open || slave < 1 || slave > impl_->slave_count) {
+        return EcatState::None;
+    }
+    ecx_readstate(&impl_->ctx);
+    const ec_slavet& s = impl_->ctx.slavelist[slave];
+    ETHERCAT_LOG_DEBUG("state",
+                       "slave {}: live AL state raw 0x{:04X} ({}{}) AL status 0x{:04X} ({})",
+                       slave,
+                       s.state,
+                       to_string(from_soem_state(s.state)),
+                       (s.state & EC_STATE_ERROR) != 0 ? " +ERROR" : "",
+                       s.ALstatuscode,
+                       ec_ALstatuscode2string(s.ALstatuscode));
+    return from_soem_state(s.state);
+}
+
 EcatState SoemBackend::slave_state(std::uint16_t slave) const {
     if (slave > impl_->slave_count) {
         return EcatState::None;
@@ -372,7 +473,7 @@ void SoemBackend::configure_dc_configdc() {
     // return TRUE, or a DC-only drive refuses OP with AL 0x0027 "Freerun not supported".
     // SYNC0 is not armed here; arm_dc_sync does that, in PRE-OP.
     const boolean dc_found = ecx_configdc(&impl_->ctx);
-    std::cerr << "[dc] ecx_configdc() returned " << (dc_found == TRUE ? "TRUE (DC slaves found)" : "FALSE (NO DC slaves)") << '\n';
+    ETHERCAT_LOG_INFO("dc", "ecx_configdc() returned {}", dc_found == TRUE ? "TRUE (DC slaves found)" : "FALSE (NO DC slaves)");
     if (dc_found == FALSE) {
         throw Error("use_distributed_clocks is set but ecx_configdc() found NO DC-capable slave on the bus");
     }
@@ -392,6 +493,7 @@ void SoemBackend::arm_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_n
     // (stock 100ms SyncDelay).
     for (int i = 1; i <= impl_->ctx.slavecount; ++i) {
         ecx_dcsync0(&impl_->ctx, static_cast<std::uint16_t>(i), TRUE, cycle_ns, sync0_shift_ns);
+        ETHERCAT_LOG_INFO("dc", "slave {}: SYNC0 armed in PRE-OP, cycle {} ns, shift {} ns", i, cycle_ns, sync0_shift_ns);
     }
 }
 
@@ -429,7 +531,8 @@ void SoemBackend::close() noexcept {
         // and ecx_writestate/ecx_statecheck do not throw.
         impl_->ctx.slavelist[0].state = EC_STATE_INIT;
         ecx_writestate(&impl_->ctx, 0);
-        ecx_statecheck(&impl_->ctx, 0, EC_STATE_INIT, EC_TIMEOUTSTATE);
+        const std::uint16_t reached = ecx_statecheck(&impl_->ctx, 0, EC_STATE_INIT, EC_TIMEOUTSTATE);
+        ETHERCAT_LOG_INFO("close", "bus walked down to INIT (reached {}), closing the interface", to_string(from_soem_state(reached)));
         ecx_close(&impl_->ctx);
         impl_->is_open = false;
     }

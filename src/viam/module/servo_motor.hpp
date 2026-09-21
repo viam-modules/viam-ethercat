@@ -22,9 +22,11 @@
 
 #include <viam/sdk/components/motor.hpp>
 #include <viam/sdk/config/resource.hpp>
+#include <viam/sdk/log/logging.hpp>
 #include <viam/sdk/registry/registry.hpp>
 #include <viam/sdk/resource/reconfigurable.hpp>
 
+#include "ethercat/log.hpp"
 #include "viam/lib/servo_controller.hpp"
 
 namespace ethercat::servo {
@@ -83,6 +85,9 @@ class ServoMotor final : public Motor, public Reconfigurable {
     std::vector<GeometryConfig> get_geometries(const ProtoStruct& extra) override;
 
    private:
+    void install_logging(viam::sdk::log_level level);
+
+    std::shared_ptr<ethercat::log::Sink> log_sink_;  // declared before controller_: outlives the RT thread
     std::unique_ptr<ServoController> controller_;
 };
 

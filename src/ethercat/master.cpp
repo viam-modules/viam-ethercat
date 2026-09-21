@@ -4,11 +4,13 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <format>
 #include <span>
 #include <string>
 #include <utility>
 
 #include "ethercat/cia402.hpp"
+#include "ethercat/log.hpp"
 
 namespace ethercat {
 
@@ -90,6 +92,12 @@ Master::Master(MasterConfig config) : config_(std::move(config)), backend_(std::
 }
 
 void Master::init() {
+    ETHERCAT_LOG_INFO("init",
+                      "opening '{}' expecting {} slave(s), loop {} Hz, DC {}",
+                      config_.ifname,
+                      config_.slaves.size(),
+                      config_.target_loop_rate_hz,
+                      config_.use_distributed_clocks ? "on" : "off");
     const std::size_t count = backend_->open(config_.ifname);
     if (count != config_.slaves.size()) {
         throw Error("EtherCAT bus on '" + config_.ifname + "': found " + std::to_string(count) + " slaves, config expects " +
@@ -126,14 +134,18 @@ std::map<std::uint32_t, Master::MappedField> Master::build_field_table(std::uint
 void Master::configure() {
     // Maps are writable only in PRE-OP and are not stored in EEPROM, so this runs
     // every configure() / power-on.
+    ETHERCAT_LOG_INFO("configure", "phase 1/5: all slaves -> PRE-OP");
     backend_->request_state(0, EcatState::PreOp);
 
     for (const SlaveConfig& sc : config_.slaves) {
+        ETHERCAT_LOG_INFO("configure", "phase 2/5: slave {}: applying RxPDO map (SM2)", sc.slave_id);
         apply_pdo_map(*backend_, sc.slave_id, sc.rxpdo, PdoDirection::Rx);
+        ETHERCAT_LOG_INFO("configure", "phase 2/5: slave {}: applying TxPDO map (SM3)", sc.slave_id);
         apply_pdo_map(*backend_, sc.slave_id, sc.txpdo, PdoDirection::Tx);
         // Set modes-of-operation (0x6060, U8) via SDO; it is not mapped cyclically. A drive
         // left in mode 0 never moves. PP=1 / PV=3, from the configured default_mode.
         const std::array<std::byte, 1> mode{static_cast<std::byte>(static_cast<std::uint8_t>(sc.default_mode))};
+        ETHERCAT_LOG_INFO("configure", "phase 3/5: slave {}: 0x6060 <- {} via SDO", sc.slave_id, static_cast<int>(sc.default_mode));
         backend_->sdo_write(sc.slave_id, kModesOfOp, 0, mode);
     }
 
@@ -141,9 +153,11 @@ void Master::configure() {
     const auto cycle_ns = static_cast<std::uint32_t>(kNsPerSec / static_cast<long>(config_.target_loop_rate_hz));
 
     if (config_.use_distributed_clocks) {
+        ETHERCAT_LOG_INFO("configure", "phase 4/5: arming SYNC0 in PRE-OP (cycle {} ns)", cycle_ns);
         backend_->arm_dc_sync(cycle_ns, config_.dc_sync0_shift_ns);
     }
 
+    ETHERCAT_LOG_INFO("configure", "phase 4/5: mapping the process image (config_map_group)");
     backend_->map_process_data();
     expected_wkc_ = backend_->expected_wkc();
 
@@ -166,12 +180,41 @@ void Master::configure() {
         rt.io = backend_->slave_io(sc.slave_id);
         rt.rx_fields = build_field_table(sc.slave_id, sc.rxpdo);
         rt.tx_fields = build_field_table(sc.slave_id, sc.txpdo);
+        ETHERCAT_LOG_DEBUG("configure",
+                           "slave {}: applied image matches config (Rx {} B, Tx {} B); {} rx fields, {} tx fields",
+                           sc.slave_id,
+                           rx_bytes,
+                           tx_bytes,
+                           rt.rx_fields.size(),
+                           rt.tx_fields.size());
+        if (log::enabled(log::Level::Debug)) {
+            for (const auto& [key, f] : rt.rx_fields) {
+                ETHERCAT_LOG_DEBUG("configure",
+                                   "slave {}: rx 0x{:04X}:{:02X} @ byte {} ({} bits)",
+                                   sc.slave_id,
+                                   key >> 8U,
+                                   key & 0xFFU,
+                                   f.byte_offset,
+                                   f.bit_length);
+            }
+            for (const auto& [key, f] : rt.tx_fields) {
+                ETHERCAT_LOG_DEBUG("configure",
+                                   "slave {}: tx 0x{:04X}:{:02X} @ byte {} ({} bits)",
+                                   sc.slave_id,
+                                   key >> 8U,
+                                   key & 0xFFU,
+                                   f.byte_offset,
+                                   f.bit_length);
+            }
+        }
     }
 
     if (config_.use_distributed_clocks) {
+        ETHERCAT_LOG_INFO("configure", "phase 4/5: configdc (reference clock, offsets, propagation delays)");
         backend_->configure_dc_configdc();
     }
 
+    ETHERCAT_LOG_INFO("configure", "phase 5/5: all slaves -> SAFE-OP");
     backend_->request_state(0, EcatState::SafeOp);
 
     dc_enabled_ = config_.use_distributed_clocks;
@@ -199,6 +242,15 @@ BringupStatus Master::bringup_step(bool drive_sync_faulted, bool drive_present) 
                 target = config_.dc_op_gate_cycles;
             }
             if (++bringup_settle_count_ >= target) {
+                // One-shot phase-transition line (RT thread; same standard as the bus-fault line).
+                // RT-context log (one-shot; the RT rule in log.hpp)
+                ETHERCAT_LOG_DEBUG("bringup",
+                                   "requesting OP once after {} settle cycle(s) (wkc {}/{}, sync-faulted {}, present {})",
+                                   bringup_settle_count_,
+                                   wkc,
+                                   expected_wkc_,
+                                   drive_sync_faulted,
+                                   drive_present);
                 backend_->set_state(0, EcatState::Op);  // writestate only; this loop pumps the transition
                 bringup_await_count_ = 0;
                 bringup_op_hold_streak_ = 0;
@@ -208,8 +260,18 @@ BringupStatus Master::bringup_step(bool drive_sync_faulted, bool drive_present) 
         }
         case BringupPhase::AwaitOp: {
             ++bringup_await_count_;
-            // reset al code
+            // Latch the last non-zero AL status code; log each CHANGE once (the drive's live reason
+            // for refusing OP), never per cycle.
             if (const std::uint16_t al = backend_->al_status_code(1); al != 0) {
+                if (al != bringup_al_code_) {
+                    // RT-context log (one-shot; the RT rule in log.hpp)
+                    ETHERCAT_LOG_DEBUG("bringup",
+                                       "await-OP cycle {}: slave 1 AL status 0x{:04X} ({}), state {}",
+                                       bringup_await_count_,
+                                       al,
+                                       SoemBackend::describe_al_code(al),
+                                       to_string(backend_->slave_state(1)));
+                }
                 bringup_al_code_ = al;
             }
             if (bringup_await_count_ % op_nudge_interval_cycles_ == 0) {
@@ -222,6 +284,13 @@ BringupStatus Master::bringup_step(bool drive_sync_faulted, bool drive_present) 
                 bringup_op_hold_streak_ = 0;
             }
             if (bringup_op_hold_streak_ >= op_hold_confirm_cycles_) {
+                // RT-context log (one-shot; the RT rule in log.hpp)
+                ETHERCAT_LOG_DEBUG("bringup",
+                                   "OPERATIONAL confirmed after {} await cycle(s): held {} cycles at wkc {}/{}",
+                                   bringup_await_count_,
+                                   bringup_op_hold_streak_,
+                                   wkc,
+                                   expected_wkc_);
                 operational_.store(true, std::memory_order_relaxed);
                 settle_remaining_ = dc_enabled_ ? config_.dc_settle_cycles : 0;
                 fault_.store(false, std::memory_order_relaxed);
@@ -230,6 +299,18 @@ BringupStatus Master::bringup_step(bool drive_sync_faulted, bool drive_present) 
                 return BringupStatus::Operational;
             }
             if (bringup_await_count_ >= op_await_bound_cycles_) {
+                // RT-context log (one-shot; the RT rule in log.hpp)
+                ETHERCAT_LOG_ERROR("bringup",
+                                   "giving up awaiting OP after {} cycles: last wkc {}/{}, sync-faulted {}, present {}, slave 1 state {},"
+                                   " last AL 0x{:04X} ({})",
+                                   bringup_await_count_,
+                                   wkc,
+                                   expected_wkc_,
+                                   drive_sync_faulted,
+                                   drive_present,
+                                   to_string(backend_->slave_state(1)),
+                                   bringup_al_code_,
+                                   SoemBackend::describe_al_code(bringup_al_code_));
                 bringup_phase_ = BringupPhase::Aborted;
                 return BringupStatus::Aborted;
             }
