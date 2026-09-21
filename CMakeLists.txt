@@ -189,6 +189,7 @@ target_sources(ethercat
     src/ethercat/soem_backend.cpp
     src/viam/lib/motion_profile.cpp
     src/viam/lib/servo_config.cpp
+    src/viam/lib/motion_mode.cpp
     src/viam/lib/servo_controller.cpp
 )
 
