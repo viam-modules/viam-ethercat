@@ -157,6 +157,10 @@ class Master {
     // an AL transition (e.g. 0x0027 "Freerun not supported" on a DC-only drive requested into OP
     // without SYNC0). A cached read (no port I/O), so a consumer can read it at a bring-up
     // give-up to name the cause. 0 means no error. Delegates to the backend.
+    // Live AL state readback (non-RT, blocking frames); refreshes al_status_code(slave) too.
+    EcatState refresh_slave_state(std::uint16_t slave) {
+        return backend_->refresh_slave_state(slave);
+    }
     std::uint16_t al_status_code(std::uint16_t slave) const noexcept {
         return backend_->al_status_code(slave);
     }

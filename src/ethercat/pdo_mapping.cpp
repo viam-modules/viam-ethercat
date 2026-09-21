@@ -2,9 +2,11 @@
 
 #include <array>
 #include <cstddef>
+#include <format>
 #include <string>
 
 #include "ethercat/errors.hpp"
+#include "ethercat/log.hpp"
 #include "ethercat/pdo_buffer.hpp"
 #include "ethercat/util.hpp"
 
@@ -44,6 +46,25 @@ std::size_t PdoMap::byte_size() const {
 
 void apply_pdo_map(SoemBackend& backend, std::uint16_t slave, const PdoMap& map, PdoDirection dir) {
     const std::uint16_t assign_index = map.assign_index(dir);  // derived from direction (or override)
+    if (log::enabled(log::Level::Debug)) {
+        std::string desc;
+        for (const std::uint16_t pdo : map.pdo_indices) {
+            desc += " " + hex(pdo) + "[";
+            if (const auto it = map.entries.find(pdo); it != map.entries.end()) {
+                for (const PdoEntry& e : it->second) {
+                    desc += std::format(" {:#06x}:{:02X}/{}", e.index, e.subindex, e.bit_length);
+                }
+            }
+            desc += " ]";
+        }
+        ETHERCAT_LOG_DEBUG("map",
+                           "slave {}: {} map -> SM assign {}:{} ({} B)",
+                           slave,
+                           dir == PdoDirection::Rx ? "RxPDO" : "TxPDO",
+                           hex(assign_index),
+                           desc,
+                           map.byte_size());
+    }
     // (a) Disable the SM PDO assignment (count := 0) so the entries are writable.
     sdo_write_scalar<std::uint8_t>(backend, slave, assign_index, 0x00, 0);
 

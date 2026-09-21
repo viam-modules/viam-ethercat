@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -11,6 +10,7 @@
 #include <utility>
 
 #include "ethercat/errors.hpp"
+#include "ethercat/log.hpp"
 
 namespace ethercat {
 
@@ -178,13 +178,12 @@ void Runner::stop() noexcept {
             // kept alive past its owner, so abort the process instead of tearing down. The
             // drive is already safe (process data gapped upstream of the wedge, so the SM
             // watchdog de-energizes it in about 50 ms); the supervisor restarts the module.
-            (void)std::fprintf(stderr,
-                               "[ethercat] Runner::stop: RT loop WEDGED -- step() did not return within the bounded "
-                               "teardown ceiling. The RT thread is parked inside a control's step() and cannot be "
-                               "reclaimed; continuing teardown would use-after-free the control it still holds. "
-                               "FAIL-STOP: aborting the module process. The drive de-energizes via the SM watchdog "
-                               "(PD gapped upstream of the wedge); the supervisor will restart the module.\n");
-            (void)std::fflush(stderr);
+            ETHERCAT_LOG_ERROR("runner",
+                               "stop: RT loop WEDGED -- step() did not return within the bounded teardown ceiling. The RT "
+                               "thread is parked inside a control's step() and cannot be reclaimed; continuing teardown would "
+                               "use-after-free the control it still holds. FAIL-STOP: aborting the module process. The drive "
+                               "de-energizes via the SM watchdog (PD gapped upstream of the wedge); the supervisor will "
+                               "restart the module.");
             std::abort();
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -330,8 +329,7 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
                 // Emit a one-shot line naming the fault. master_.last_error() is lock-free (it
                 // reads the fault atomics), and this fires exactly once, since the next cycle
                 // takes the stopping path and skips this block.
-                (void)std::fprintf(stderr, "[ethercat] BUS FAULT -- %s. Entering teardown.\n", master_.last_error().c_str());
-                (void)std::fflush(stderr);
+                ETHERCAT_LOG_ERROR("runner", "BUS FAULT -- {}. Entering teardown.", master_.last_error());
                 stop_flag_.store(true, std::memory_order_release);
             }
             if (stop_flag_.load(std::memory_order_acquire)) {
@@ -353,13 +351,12 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
         rt_overrun_worst = std::max(skipped, rt_overrun_worst);
         if (static_cast<std::uint64_t>(skipped) * period_ns >= kRtOverrunReportNs && !rt_overrun_logged) {
             rt_overrun_logged = true;  // one-shot -- a fault/teardown typically follows within cycles
-            (void)std::fprintf(stderr,
-                               "[ethercat] RT cycle overrun %.1fms (%u cycles) at cycle %llu -- the SCHED_FIFO RT thread was "
-                               "starved (host contention / page fault / priority inversion).\n",
-                               static_cast<double>(static_cast<std::uint64_t>(skipped) * period_ns) / 1e6,
-                               skipped,
-                               static_cast<unsigned long long>(cycle));
-            (void)std::fflush(stderr);
+            ETHERCAT_LOG_WARN("runner",
+                              "RT cycle overrun {:.1f}ms ({} cycles) at cycle {} -- the SCHED_FIFO RT thread was starved (host "
+                              "contention / page fault / priority inversion)",
+                              static_cast<double>(static_cast<std::uint64_t>(skipped) * period_ns) / 1e6,
+                              skipped,
+                              cycle);
         }
         ++cycle;
         if (stopping) {
