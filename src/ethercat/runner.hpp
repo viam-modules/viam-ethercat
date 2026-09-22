@@ -304,6 +304,13 @@ class SlaveControl {
         (void)ctx;
         return true;
     }
+    // RT, every bring-up cycle (SAFE-OP through the OP request): stage the command objects the drive
+    // sees while process data starts. The default leaves the image zero. A control whose mode streams
+    // a set-point must make it track the actual here: a drive compares the target with the actual as
+    // soon as process data flows, before any enable ladder runs.
+    virtual void stage_bringup_outputs(CycleContext& ctx) noexcept {
+        (void)ctx;
+    }
     // RT, every stopping cycle (after step()): is this control safely torn down -- de-energized
     // at rest -- so the Runner may end the teardown window early? teardown_cycles is the cap;
     // this is the event-driven early-out. Defaults to false, running the full window. A control

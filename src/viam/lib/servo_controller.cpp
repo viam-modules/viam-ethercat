@@ -59,7 +59,6 @@ MasterConfig build_master_config(const ServoConfig& c) {
     // Always switch-capable; seed the SDO default mode to PP. 0x6060 is RxPDO-mapped, so the
     // per-cycle PDO mode from the selected motion mode governs at runtime; this is only the
     // pre-cycling default.
-    slave.default_mode = Cia402Mode::ProfilePosition;
     // No slave.fault_reset: the vendor reset is consumer-side (run_vendor_fault_reset, executed
     // pre-RT-spawn in start()/reconfigure()).
     slave.sync_cycle_granularity_ns = c.sync_cycle_granularity_ns;  // Master validates rate vs granularity up front
@@ -233,7 +232,7 @@ void ServoController::spawn_runner() {
         rt_runner_->start();  // on_configured (no-op), then spawn the RT thread
     } catch (const Error& e) {
         // Refusal or attach failure at start -> Degraded; drop the un-started Runner.
-        degraded_reason_ = std::string("ServoController degraded at start: ") + e.what();
+        degraded_reason_ = e.what();
         degraded_.store(true, std::memory_order_release);
         rt_runner_.reset();  // ~Runner: never started, so no join/close, just frees
     }
@@ -253,6 +252,12 @@ void ServoController::bring_up() {
         run_vendor_fault_reset();  // clear drive errors before bring-up (device seam; single port owner)
         if (attempt_bringup()) {
             return;  // reached OP
+        }
+        if (!degraded_reason_.empty()) {
+            // A configure-time refusal (control mode, quick-stop objects) is not transient: fail start()/reconfigure() with it.
+            const std::string why = degraded_reason_;
+            rt_runner_.reset();
+            throw Error(why);
         }
         if (attempt >= kMaxBringupAttempts) {
             ETHERCAT_LOG_ERROR("servo",
@@ -397,14 +402,16 @@ void ServoController::bump_wake() noexcept {
     wake_seq_.notify_all();
 }
 
-std::uint16_t ServoController::fault_reset_with_rearm(Status status) noexcept {
-    const std::uint16_t level = fsm_.step(status, Cia402State::OperationEnabled);  // 0x80 while Fault
-    // Drive the RISING edge: if bit7 is asserted again while it was already
-    // asserted last cycle, drop it for one cycle so the drive sees a fresh edge.
-    if ((level & ControlWord::kFaultResetBit) != 0 && (last_cw_ & ControlWord::kFaultResetBit) != 0) {
-        return static_cast<std::uint16_t>(level & ~ControlWord::kFaultResetBit);
-    }
-    return level;
+std::uint16_t ServoController::enter_resetting(CycleContext& ctx) noexcept {
+    lifecycle_ = Resetting{};
+    reset_cycles_ = 0;
+    clear_streak_ = 0;
+    ETHERCAT_LOG_WARN("servo",
+                      "slave {}: drive fault {} -- presenting a fault-reset edge every {} cycles until it clears",
+                      config_.slave_id,
+                      hex(f_fault_code_ ? ctx.load<std::uint16_t>(*f_fault_code_) : std::uint16_t{0}),
+                      config_.fault_reset_window_cycles);
+    return ControlWord::fault_reset();  // bit 7 rising edge (the previous controlword had it low)
 }
 
 void ServoController::abort_active_move(RtError reason) noexcept {
@@ -474,11 +481,26 @@ const char* ServoController::motion_mode_name() const noexcept {
     return motion_ ? motion_->name() : "unselected";
 }
 
-// Construct the motion mode for this run: profile position/velocity, driven by the drive's own
-// trajectory generator. Runs pre-spawn on the non-RT thread after Master::configure().
+// Construct the motion mode named by config_.motion_mode. Runs pre-spawn on the non-RT thread; the
+// mode's resolve() then selects it on the drive by SDO, so an unsupported mode fails start() with a
+// clear error rather than a drive that never moves.
 void ServoController::select_motion_mode() {
-    motion_ = std::make_unique<ProfilePositionMode>(config_.quick_stop_decel, 2);
-    ETHERCAT_LOG_INFO("servo", "slave {}: motion mode PP (profile position/velocity)", config_.slave_id);
+    if (config_.motion_mode == MotionModeKind::Profile) {
+        motion_ = std::make_unique<ProfilePositionMode>(config_.quick_stop_decel, 2);
+        ETHERCAT_LOG_INFO("servo", "slave {}: control_mode profile (PP for go_to/go_for, PV for set_rpm)", config_.slave_id);
+        return;
+    }
+    const double dt = 1.0 / static_cast<double>(config_.target_loop_rate_hz);
+    const double accel_rpm_s = config_.max_accel_rpm_per_s > 0.0 ? config_.max_accel_rpm_per_s : config_.max_motor_speed_rpm;
+    const double accel_cps2 = static_cast<double>(rpm_to_device_velocity(accel_rpm_s, config_.counts_per_rev, config_.gear_ratio));
+    const double vmax_cps =
+        static_cast<double>(rpm_to_device_velocity(config_.max_motor_speed_rpm, config_.counts_per_rev, config_.gear_ratio));
+    motion_ = std::make_unique<CyclicPositionMode>(dt, accel_cps2, vmax_cps);
+    ETHERCAT_LOG_INFO("servo",
+                      "slave {}: control_mode csp (master-side trapezoid, accel {} counts/s^2, vmax {} counts/s)",
+                      config_.slave_id,
+                      accel_cps2,
+                      vmax_cps);
 }
 
 std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, const CommandBatch& batch, std::int32_t actual) noexcept {
@@ -519,57 +541,40 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
 
     if (std::holds_alternative<Init>(lifecycle_)) {
         if (dev == Cia402State::Fault) {
-            lifecycle_ = Faulted{};
-        } else {
-            lifecycle_ = Enabling{};
-            mode_gate_ = ModeGate::Pending;  // re-arm the mode-echo gate for this bring-up
+            return enter_resetting(ctx);  // a fault latched before this run (previous session, refused SDO)
         }
+        lifecycle_ = Enabling{};
+        mode_echo_wait_ = 0;
         return ControlWord::disable_voltage();
     }
     if (std::holds_alternative<Enabling>(lifecycle_)) {
         if (dev == Cia402State::Fault) {
-            lifecycle_ = Faulted{};
-            return ControlWord::disable_voltage();  // latch the fault; reset is explicit (Faulted handles it)
+            return enter_resetting(ctx);
         }
-        // Seed 0x6060 = commanded mode through the enable ladder. The module's own enable FSM (not the
-        // sequencer, which is stepped only post-OperationEnabled) drives the ladder, so it must write the
-        // mode itself, else on a PDO-mapped-0x6060 map the drive follows the PDO (=0) and enables in mode
-        // 0. Inert when 0x6060 is SDO-set only: f_mode_wr_ is nullopt.
         if (f_mode_wr_) {
-            ctx.store<cia402::ModeOfOperation::type>(
-                *f_mode_wr_, static_cast<std::int8_t>(commanded_cia402_mode()));  // switchable: the current mode intent
+            ctx.store<cia402::ModeOfOperation::type>(*f_mode_wr_, static_cast<std::int8_t>(commanded_cia402_mode()));
         }
-        // Mode-echo gate, in the module's own ladder: once the drive is SwitchedOn the commanded mode
-        // should be adopted (SDO-set at configure, or PDO-seeded above), so require 0x6061 == commanded
-        // before energizing to OperationEnabled. A mismatch (the drive silently ignored the mode) latches
-        // Failed, de-energizes, and sets RtError::ModeMismatch (last_error), sticky so there is no
-        // ReadyToSwitchOn <-> SwitchedOn oscillation. Inert when 0x6061 is not mapped. Mirrors the
-        // sequencer's gate, which the module never reaches (it delegates to the sequencer only post-OperationEnabled).
-        if (mode_gate_ == ModeGate::Pending && f_mode_disp_ && (dev == Cia402State::SwitchedOn || dev == Cia402State::OperationEnabled)) {
-            const auto want = static_cast<std::int8_t>(commanded_cia402_mode());  // gate on the commanded (intent) mode
-            const auto echo = ctx.load<cia402::ModeDisplay::type>(*f_mode_disp_);
-            if (echo == want) {
-                mode_gate_ = ModeGate::Passed;
-                ETHERCAT_LOG_INFO("servo",
-                                  "slave {}: mode-echo gate PASSED at {}: 0x6061 = {} == commanded {}",
-                                  config_.slave_id,
-                                  to_string(dev),
-                                  static_cast<int>(echo),
-                                  static_cast<int>(want));
-            } else {
-                mode_gate_ = ModeGate::Failed;
+        // Energize only once 0x6061 echoes the commanded mode; hold at SwitchedOn meanwhile. A drive
+        // that never echoes it is reported once (ModeMismatch) and stays at SwitchedOn, de-energized.
+        const auto want = static_cast<std::int8_t>(commanded_cia402_mode());
+        const bool echoed = !f_mode_disp_ || ctx.load<cia402::ModeDisplay::type>(*f_mode_disp_) == want;
+        if (!echoed && (dev == Cia402State::SwitchedOn || dev == Cia402State::OperationEnabled)) {
+            if (++mode_echo_wait_ == kModeEchoCycles) {
                 latched_ctrl_error_ = RtError::ModeMismatch;
-                rt_error_.store(RtError::ModeMismatch, std::memory_order_release);
                 ETHERCAT_LOG_WARN("servo",
-                                  "slave {}: mode-echo gate FAILED at {}: 0x6061 = {} != commanded {} -- staying de-energized",
+                                  "slave {}: 0x6061 = {} != commanded {} after {} cycles -- not energizing",
                                   config_.slave_id,
-                                  to_string(dev),
-                                  static_cast<int>(echo),
-                                  static_cast<int>(want));
+                                  static_cast<int>(ctx.load<cia402::ModeDisplay::type>(*f_mode_disp_)),
+                                  static_cast<int>(want),
+                                  kModeEchoCycles);
             }
+            return fsm_.step(status, Cia402State::SwitchedOn);
         }
-        if (mode_gate_ == ModeGate::Failed) {
-            return ControlWord::disable_voltage();  // refuse: stay de-energized (is_powered false)
+        if (echoed) {
+            mode_echo_wait_ = 0;
+            if (latched_ctrl_error_ == RtError::ModeMismatch) {
+                latched_ctrl_error_ = RtError::None;
+            }
         }
         if (dev == Cia402State::OperationEnabled) {
             lifecycle_ = Operational{};
@@ -579,8 +584,10 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
     }
     if (std::holds_alternative<Operational>(lifecycle_)) {
         if (dev == Cia402State::Fault || bus_fault) {
-            lifecycle_ = Faulted{};
-            return ControlWord::disable_voltage();
+            // Terminate the in-flight blocking move (its waiter throws with last_error(); the
+            // single-in-flight slot frees) and start the standard recovery.
+            abort_active_move(RtError::NotOperational);
+            return enter_resetting(ctx);
         }
         if (batch.disable) {
             lifecycle_ = Disabled{};
@@ -599,58 +606,32 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         return cw;
     }
     if (std::holds_alternative<Resetting>(lifecycle_)) {
-        // Operator override: a disable while resetting wins.
-        if (batch.disable) {
+        if (batch.disable) {  // operator override
             lifecycle_ = Disabled{};
-            clear_streak_ = 0;
             return ControlWord::disable_voltage();
         }
-        // Debounce the clear: a refault re-arms the streak, so a momentary clear-then-refault never
-        // confirms (it is not mistaken for success).
-        if (dev != Cia402State::Fault) {
-            ++clear_streak_;
-        } else {
-            clear_streak_ = 0;
-        }
-        // Success: the clear held for K consecutive cycles, so recovery is confirmed.
+        // Standard CiA402 recovery: a fault-reset edge (bit 7) once per window while the drive stays in
+        // Fault, bit low in between so the next one is a real edge. Once the drive has left Fault for
+        // the confirm streak, hand back to the enable ladder. last_error() shows the fault meanwhile.
+        clear_streak_ = dev != Cia402State::Fault ? clear_streak_ + 1 : 0;
         if (clear_streak_ >= config_.fault_reset_clear_confirm_cycles) {
+            ETHERCAT_LOG_INFO("servo", "slave {}: drive fault cleared after {} cycles -- re-enabling", config_.slave_id, reset_cycles_);
             lifecycle_ = Enabling{};
-            clear_streak_ = 0;
-            return fsm_.step(status, Cia402State::OperationEnabled);  // hand off to the enable ladder
+            mode_echo_wait_ = 0;
+            return fsm_.step(status, Cia402State::OperationEnabled);
         }
-        // Window remaining: keep working. Decrement every cycle (Fault or confirming), not only on
-        // Fault cycles, so a flickering drive's total dwell stays bounded by the window regardless of
-        // flicker period. Present the reset edge only while in Fault; while confirming a clear, return
-        // a neutral controlword (don't pulse bit 7 at an already-clearing drive).
-        if (reset_cycles_remaining_ > 0) {
-            --reset_cycles_remaining_;
-            return (dev == Cia402State::Fault) ? fault_reset_with_rearm(status) : ControlWord::disable_voltage();
+        ++reset_cycles_;
+        if (batch.fault_reset) {  // operator request: an edge now
+            reset_cycles_ = 0;
+            return ControlWord::fault_reset();
         }
-        // Give up: the window expired without a confirmed clear (never cleared, or cleared but never
-        // confirmed). Revert to Faulted with a diagnostic; do not re-enter Resetting. Cleared by the
-        // next operator fault_reset.
-        latched_ctrl_error_ = RtError::FaultResetFailed;
-        lifecycle_ = Faulted{};
-        clear_streak_ = 0;
-        return ControlWord::disable_voltage();
-    }
-    if (std::holds_alternative<Faulted>(lifecycle_)) {
-        if (batch.fault_reset) {
-            // Enter Resetting and hold the reset intent for the recovery window: the command-queue
-            // fault_reset is a one-shot (consumed this cycle), so the sub-state, not the flag, carries
-            // the intent across the drive's clear-reflect latency. A persistent bus WkcFault still
-            // reappears next cycle via the live tier; it needs reconfigure, not fault_reset.
-            latched_ctrl_error_ = RtError::None;  // clear the prior diagnostic (incl. a prior FaultResetFailed)
-            lifecycle_ = Resetting{};
-            reset_cycles_remaining_ = config_.fault_reset_window_cycles;
-            clear_streak_ = 0;                      // start the debounce fresh
-            return fault_reset_with_rearm(status);  // present the first reset edge
-        }
-        return ControlWord::disable_voltage();
+        const bool edge = dev == Cia402State::Fault && (reset_cycles_ % config_.fault_reset_window_cycles) == 0;
+        return edge ? ControlWord::fault_reset() : ControlWord::disable_voltage();
     }
     // Disabled
     if (batch.enable) {
         lifecycle_ = Enabling{};
+        mode_echo_wait_ = 0;
     }
     return ControlWord::disable_voltage();
 }
@@ -745,6 +726,14 @@ void ServoController::on_operational(CycleContext& ctx) noexcept {
     // No explicit seed: the std::variant lifecycle climbs Init->Enabling->Operational inside
     // step_lifecycle off the drive state.
     (void)ctx;
+}
+
+void ServoController::stage_bringup_outputs(CycleContext& ctx) noexcept {
+    // The mode's set-points track the actual from the first process-data frame (CSP: 0x607A = 0x6064).
+    // A zero target against a non-zero actual is a following-error fault at OP entry, before the
+    // enable ladder runs. Profile mode has nothing to stage: the drive holds its own set-points.
+    const Status st{ctx.load<cia402::Statusword::type>(f_statusword_)};
+    motion_->track(ctx, feedback(ctx, st, ctx.load<std::int32_t>(f_actual_)));
 }
 
 bool ServoController::drive_present(const CycleContext& ctx) const noexcept {
@@ -1007,6 +996,11 @@ bool ServoController::motion_slot_busy() const noexcept {
     return cur != 0 && !gen_terminal(cur);  // a LIVE (non-terminal) blocking move owns the slot
 }
 
+void ServoController::release_motion_slot(std::uint32_t gen) noexcept {
+    std::uint32_t cur = gen;
+    (void)motion_slot_.compare_exchange_strong(cur, 0U, std::memory_order_acq_rel, std::memory_order_acquire);  // only if still ours
+}
+
 bool ServoController::try_claim_motion_slot(std::uint32_t gen) noexcept {
     // Single-CAS claim: succeed only if the slot is free or holds an already-terminal gen (reclaim). A
     // concurrent second claimer that read the same terminal `cur` loses the CAS, reloads a live gen,
@@ -1039,14 +1033,19 @@ void ServoController::await_move(std::uint32_t generation) {
             state_.active_generation.load(std::memory_order_acquire) > g) {
             return;  // completed (or superseded by a newer move -- benign)
         }
+        // Every failure path releases the single-in-flight slot: a move that will never complete
+        // (RT loop gone, aborted, or the drive faulted before or during it) must not block later commands.
         if (stopping_.load(std::memory_order_acquire) || rt_exited_.load(std::memory_order_acquire)) {
-            throw Error("move: controller stopped / RT loop not alive");  // RT loop exited (stop / bus fault / bring-up abort)
+            release_motion_slot(g);
+            throw Error("move: controller stopped / RT loop not alive");
         }
         if (state_.failed_generation.load(std::memory_order_acquire) >= g) {
+            release_motion_slot(g);
             throw Error("move aborted (" + last_error() + ")");
         }
         if (state_.faulted.load(std::memory_order_acquire)) {
-            throw Error("move: drive faulted during the move");
+            release_motion_slot(g);
+            throw Error("move: drive faulted (" + last_error() + ")");
         }
         wake_seq_.wait(seq, std::memory_order_acquire);  // block until a wake bump (or a spurious wake -> re-check)
     }
@@ -1265,9 +1264,6 @@ std::string ServoController::last_error() const {
             break;
         case RtError::NotOperational:
             append("drive not operational");
-            break;
-        case RtError::FaultResetFailed:
-            append("fault-reset ineffective -- cause persists");
             break;
         case RtError::MotorStopped:
             append("motor stopped");

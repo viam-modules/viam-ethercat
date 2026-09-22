@@ -1,8 +1,10 @@
 #include "viam/lib/motion_mode.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <string>
 
 #include "ethercat/errors.hpp"
 #include "ethercat/field.hpp"
@@ -11,10 +13,18 @@ namespace ethercat::servo {
 
 namespace {
 
-// Cycles to wait for 0x6061 to echo a newly commanded 0x6060 before the change counts as failed.
-// Drives adopt a PDO-carried mode within a few cycles; this bound (200 ms at 1 kHz) only turns a drive
-// that never follows into an error instead of an indefinite hold.
-constexpr std::uint32_t kModeEchoCycles = 200;
+// Select the mode on the drive by SDO (SAFE-OP, pre-spawn). A drive that does not implement the
+// configured mode refuses the value here, which fails start() with the reason.
+void select_mode_on_drive(ConfigContext& cfg, Cia402Mode mode, const char* control_mode) {
+    constexpr std::uint16_t kModesOfOp = 0x6060;
+    const std::array<std::byte, 1> v{static_cast<std::byte>(static_cast<std::uint8_t>(mode))};
+    try {
+        cfg.sdo_write(kModesOfOp, 0, v);
+    } catch (const SdoError& e) {
+        throw Error(std::string("the drive refused control_mode '") + control_mode + "' (0x6060 <- " +
+                    std::to_string(static_cast<int>(mode)) + "): " + e.what());
+    }
+}
 
 }  // namespace
 
@@ -35,6 +45,7 @@ const char* to_string(MotionFault fault) noexcept {
 // ============================================================================================
 
 std::uint32_t ProfilePositionMode::resolve(ConfigContext& cfg) {
+    select_mode_on_drive(cfg, Cia402Mode::ProfilePosition, "profile");
     // Resolve the PDO fields (controlword, statusword, 0x6060/0x6061, targets) and, when a quick-stop
     // deceleration is configured, run the one-time quick-stop SDOs: assert 0x605A, write and read back
     // 0x6085 (throws on a mismatch). Returns the echoed 0x6085 for the controller's velocity budget.
@@ -119,6 +130,73 @@ MotionFault ProfilePositionMode::fault() const noexcept {
         return MotionFault::ModeNotAdopted;
     }
     return sequencer_.state().handshake_timed_out ? MotionFault::SetpointNotAcknowledged : MotionFault::None;
+}
+
+// ============================================================================================
+// CyclicPositionMode
+// ============================================================================================
+
+std::uint32_t CyclicPositionMode::resolve(ConfigContext& cfg) {
+    select_mode_on_drive(cfg, Cia402Mode::CyclicSyncPosition, "csp");
+    f_target_pos_ = cfg.resolve_rx<cia402::TargetPosition>();  // the one command object CSP streams
+    return 0;                                                  // no drive-side quick-stop: the generator owns the stop
+}
+
+void CyclicPositionMode::reset() noexcept {
+    generator_.reseed(0);
+    positioning_ = true;
+}
+
+std::uint32_t CyclicPositionMode::shutdown_cycles() const noexcept {
+    // Ramp from the velocity ceiling to rest at accel_, plus a margin, so the shutdown window
+    // outlasts the ramp and torque is never cut at speed.
+    const double ramp_s = accel_ > 0.0 ? max_vel_cps_ / accel_ : 0.0;
+    const double cycles = (ramp_s / dt_s_) + 20.0;
+    return static_cast<std::uint32_t>(std::min(cycles, 60000.0));
+}
+
+void CyclicPositionMode::go_to(std::int32_t target_counts, std::uint32_t velocity_cps) noexcept {
+    // The controller rejects a non-positive speed upstream; a refused set_goal leaves the generator holding.
+    if (generator_.set_goal(target_counts, static_cast<double>(velocity_cps), accel_)) {
+        positioning_ = true;
+    }
+}
+
+void CyclicPositionMode::set_velocity(std::int32_t velocity_cps) noexcept {
+    if (generator_.set_velocity(static_cast<double>(velocity_cps), accel_)) {
+        positioning_ = false;
+    }
+}
+
+std::uint16_t CyclicPositionMode::step(CycleContext& ctx, const MotionFeedback& fb) noexcept {
+    (void)fb;
+    ctx.store<cia402::TargetPosition::type>(f_target_pos_, generator_.step(dt_s_));
+    return ControlWord::enable_operation();  // CSP has no handshake bits; the target does the work
+}
+
+void CyclicPositionMode::track(CycleContext& ctx, const MotionFeedback& fb) noexcept {
+    // Not enabled: the target follows the shaft so the first enabled cycle commands "stay here"
+    // (a CSP drive enabled against a stale 0x607A lunges to it).
+    generator_.reseed(fb.actual);
+    ctx.store<cia402::TargetPosition::type>(f_target_pos_, fb.actual);
+}
+
+std::uint16_t CyclicPositionMode::step_shutdown(CycleContext& ctx, const MotionFeedback& fb) noexcept {
+    // Ramp to rest while energized, then disable voltage. A drive that is already off goes straight to disable.
+    if (!fb.status.operation_enabled() || fb.status.fault()) {
+        generator_.reseed(fb.actual);
+        ctx.store<cia402::TargetPosition::type>(f_target_pos_, fb.actual);
+        return ControlWord::disable_voltage();
+    }
+    if (!generator_.idle()) {
+        if (generator_.phase() != TrapezoidGenerator::Phase::Velocity || generator_.velocity() != 0.0) {
+            generator_.stop(accel_);
+        }
+        ctx.store<cia402::TargetPosition::type>(f_target_pos_, generator_.step(dt_s_));
+        return ControlWord::enable_operation();
+    }
+    ctx.store<cia402::TargetPosition::type>(f_target_pos_, generator_.position());
+    return ControlWord::disable_voltage();
 }
 
 }  // namespace ethercat::servo
