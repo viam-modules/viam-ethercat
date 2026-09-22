@@ -89,6 +89,11 @@ struct ControllerState {
 // ~Runner joins before the Master and state tear down).
 class ServoController : public SlaveControl {
    public:
+    // control_mode when the attribute is absent; a drive-specific subclass may pin its validated mode.
+    static constexpr MotionModeKind kDefaultMotionMode = MotionModeKind::CyclicPosition;
+    virtual MotionModeKind default_motion_mode() const noexcept {
+        return kDefaultMotionMode;
+    }
     // Validates config (no I/O); throws Error. start()/reconfigure() build the
     // SoemBackend-backed Master.
     explicit ServoController(ServoConfig config);
@@ -176,7 +181,7 @@ class ServoController : public SlaveControl {
     // Motor rated current (amps), for the module's per-mille to amps conversion. Read under the
     // shared lock (reconfigure() rewrites config_ under the exclusive lock).
     double rated_current_amps() const noexcept;
-    // The motion mode selected at setup ("PP"), or "unselected" before the first start().
+    // The motion mode selected at setup ("PP", "CSP"), or "unselected" before the first start().
     const char* motion_mode_name() const noexcept;
 
    protected:
@@ -216,12 +221,11 @@ class ServoController : public SlaveControl {
    private:
     // --- lifecycle FSM (std::variant; each state's step() in the .cpp) ---
     struct Init {};
-    struct Enabling {};
+    struct Enabling {};  // climb to OperationEnabled once 0x6061 echoes the commanded mode
     struct Operational {};
-    struct Resetting {};  // holds the fault-reset intent across the drive's clear-reflect latency
-    struct Faulted {};
-    struct Disabled {};
-    using Lifecycle = std::variant<Init, Enabling, Operational, Resetting, Faulted, Disabled>;
+    struct Resetting {};  // drive in Fault: present fault-reset edges until it clears, then Enabling
+    struct Disabled {};   // operator de-energized; leaves on enable
+    using Lifecycle = std::variant<Init, Enabling, Operational, Resetting, Disabled>;
 
     // The mode-specific motion semantics live in motion_; the controller delegates to it.
 
@@ -232,7 +236,6 @@ class ServoController : public SlaveControl {
         None,
         HandshakeTimeout,
         NotOperational,
-        FaultResetFailed,
         MotorStopped,   // an in-flight move cancelled by stop()/halt(); the waiter throws
         MotorDisabled,  // an in-flight move cancelled by disable() (operator de-energize); the waiter throws
         ModeMismatch,   // 0x6061 != commanded mode at SwitchedOn; refuse to energize
@@ -247,6 +250,7 @@ class ServoController : public SlaveControl {
     void on_configured(ConfigContext& cfg) override;
     bool sync_faulted(const CycleContext& ctx) const noexcept override;
     bool drive_present(const CycleContext& ctx) const noexcept override;  // statusword != 0 (live PDO)
+    void stage_bringup_outputs(CycleContext& ctx) noexcept override;      // set-points follow the actual from the first frame
     void on_operational(CycleContext& ctx) noexcept override;
     void step(CycleContext& ctx) noexcept override;
     void on_stop(StopReason reason) noexcept override;
@@ -272,7 +276,7 @@ class ServoController : public SlaveControl {
     // thread is still the single port owner (after Master::configure(), before the RT thread
     // spawns). Best-effort: a failed clear is logged, not fatal. nullopt seam means no-op.
     void run_vendor_fault_reset();
-    // Construct motion_ for this run. Non-RT, pre-spawn, re-run on every bring-up attempt.
+    // Construct motion_ from config_.motion_mode. Non-RT, pre-spawn, re-run on every bring-up attempt.
     void select_motion_mode();
     // Package this cycle's inputs for the mode (RT).
     MotionFeedback feedback(CycleContext& ctx, Status status, std::int32_t actual) const noexcept;
@@ -294,20 +298,10 @@ class ServoController : public SlaveControl {
     FieldLocation f_ctrlword_;
     FieldLocation f_statusword_;
     FieldLocation f_actual_;
-    // Enable-ladder mode fields (optional). The module's own enable FSM (not the sequencer) climbs to
-    // OperationEnabled, so it must itself (a) seed 0x6060 = commanded mode through the ladder when
-    // 0x6060 is RxPDO-mapped (else a PDO-following drive enables in mode 0), and (b) enforce the
-    // mode-echo gate when 0x6061 is TxPDO-mapped (refuse OperationEnabled if 0x6061 != commanded;
-    // the fixed superset map does map 0x6061). Both nullopt means the respective step is inert.
-    std::optional<FieldLocation> f_mode_wr_;    // 0x6060 mode-of-operation (RxPDO write); nullopt means SDO-set only
-    std::optional<FieldLocation> f_mode_disp_;  // 0x6061 mode-display (TxPDO read); nullopt means no mode-echo gate
-    // Enable-time mode-echo gate state (RT-only). Sticky once resolved so the drive does not
-    // oscillate ReadyToSwitchOn <-> SwitchedOn: Pending until the drive is SwitchedOn with 0x6061
-    // mapped, then Passed (0x6061 == commanded, allow OperationEnabled) or Failed (mismatch, latch
-    // RtError::ModeMismatch and de-energize). Reset to Pending on Init->Enabling so a fresh
-    // bring-up or fault-recovery re-checks.
-    enum class ModeGate : std::uint8_t { Pending, Passed, Failed };
-    ModeGate mode_gate_ = ModeGate::Pending;
+    // Mode fields, both optional (nullopt = not mapped, the step is inert): the enable ladder writes
+    // 0x6060 = commanded mode and energizes only once 0x6061 echoes it.
+    std::optional<FieldLocation> f_mode_wr_;    // 0x6060 mode-of-operation (RxPDO)
+    std::optional<FieldLocation> f_mode_disp_;  // 0x6061 mode-display (TxPDO)
     // TxPDO feedback fields, both optional (nullopt means not in the map):
     std::optional<FieldLocation> f_fault_code_;       // 0x603F U16 drive error code (last_error gloss)
     std::optional<FieldLocation> f_velocity_actual_;  // 0x606C S32 velocity-actual (wire velocity; else estimate)
@@ -364,10 +358,11 @@ class ServoController : public SlaveControl {
 
     // --- RT-only working state (single-thread; plain members, no atomics or locks). Touched
     // exclusively by the RT loop and the lifecycle step()s. ---
-    std::uint16_t last_cw_ = 0;                 // for the fault-reset rising-edge re-arm
+    std::uint16_t last_cw_ = 0;                 // controlword shipped last cycle (diagnostics)
     std::uint16_t last_logged_fault_code_ = 0;  // RT-only: one-shot log on every 0x603F change
-    std::uint32_t reset_cycles_remaining_ = 0;  // Resetting-window countdown, RT-only
-    std::uint32_t clear_streak_ = 0;            // consecutive dev!=Fault cycles in Resetting (RT-only)
+    std::uint32_t reset_cycles_ = 0;            // cycles spent in Resetting (paces the fault-reset edges)
+    std::uint32_t clear_streak_ = 0;            // consecutive non-Fault cycles in Resetting
+    std::uint32_t mode_echo_wait_ = 0;          // Enabling: cycles at SwitchedOn with 0x6061 != commanded
     std::int32_t prev_actual_ = 0;              // previous-cycle actual (instantaneous velocity estimate)
     bool first_cycle_ = true;                   // skip the velocity estimate on the first cycle
     // Noise-robust "stopped": a ring of the last N actual positions; stable when the window's range
@@ -391,7 +386,7 @@ class ServoController : public SlaveControl {
     // FSM helpers (RT-only). Defined in the .cpp. ctx is used for output writes and fault reads,
     // since the Runner is the sole Master toucher.
     std::uint16_t step_lifecycle(CycleContext& ctx, Status status, const CommandBatch& batch, std::int32_t actual) noexcept;
-    std::uint16_t fault_reset_with_rearm(Status status) noexcept;
+    std::uint16_t enter_resetting(CycleContext& ctx) noexcept;  // -> Resetting; returns the first reset edge
     // Reads this cycle's owned input snapshot via ctx (0x603F, statusword, etc. all from the same
     // latched image the Runner copied in).
     void publish_state(CycleContext& ctx, Status status, std::int32_t actual, std::int32_t velocity) noexcept;
@@ -408,7 +403,8 @@ class ServoController : public SlaveControl {
     // if free or holding a terminal gen, and returning false if a live blocking move owns it.
     bool gen_terminal(std::uint32_t gen) const noexcept;
     bool try_claim_motion_slot(std::uint32_t gen) noexcept;
-    bool motion_slot_busy() const noexcept;  // a live (non-terminal) blocking move holds the slot
+    void release_motion_slot(std::uint32_t gen) noexcept;  // frees the slot if `gen` still owns it
+    bool motion_slot_busy() const noexcept;                // a live (non-terminal) blocking move holds the slot
     // Submit a PV velocity setpoint (rpm to guarded device counts) without the slot check, for
     // set_rpm (after its own check) and go_for(PV) (which owns the slot for its whole timed run).
     void push_velocity(double rpm) noexcept;

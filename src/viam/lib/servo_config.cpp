@@ -7,10 +7,14 @@
 
 namespace ethercat::servo {
 
+const char* to_string(MotionModeKind mode) noexcept {
+    return mode == MotionModeKind::CyclicPosition ? "csp" : "profile";
+}
+
 void ServoConfig::set_fixed_pdo_map() {
-    // The one fixed driver-defined superset (standard CiA402 objects only). Always switch-capable
-    // (0x6060 mapped) so any API call can ensure PP or PV at runtime. Unconditional: no per-mode
-    // choice and no user override; overwrites whatever was there.
+    // Driver-defined maps (standard CiA402 objects only), one per motion mode, no user override. The
+    // profile map carries 0x6060 so PP/PV can switch at runtime; the cyclic map has no mode byte (the
+    // mode is SDO-set once) and streams only the target position.
     constexpr std::uint16_t kCtrl = 0x6040;
     constexpr std::uint16_t kMode = 0x6060;
     constexpr std::uint16_t kTargetPos = 0x607A;
@@ -25,7 +29,11 @@ void ServoConfig::set_fixed_pdo_map() {
     const auto E = [](std::uint16_t index, std::uint8_t bits) { return ethercat::PdoEntry{index, 0, bits}; };
 
     rxpdo.pdo_indices = {0x1600};
-    rxpdo.entries[0x1600] = {E(kCtrl, 16), E(kMode, 8), E(kTargetPos, 32), E(kProfileVel, 32), E(kTargetVel, 32)};
+    if (motion_mode == MotionModeKind::CyclicPosition) {
+        rxpdo.entries[0x1600] = {E(kCtrl, 16), E(kTargetPos, 32)};
+    } else {
+        rxpdo.entries[0x1600] = {E(kCtrl, 16), E(kMode, 8), E(kTargetPos, 32), E(kProfileVel, 32), E(kTargetVel, 32)};
+    }
     txpdo.pdo_indices = {0x1A00};
     txpdo.entries[0x1A00] = {E(kFault, 16), E(kStatus, 16), E(kModeDisp, 8), E(kActualPos, 32), E(kVelAct, 32), E(kTorqueAct, 16)};
 }
@@ -36,6 +44,9 @@ void ServoConfig::validate() const {
     }
     if (slave_id < 1) {
         throw Error("servo config: 'slave_id' must be >= 1");
+    }
+    if (motion_mode == MotionModeKind::CyclicPosition && !use_distributed_clocks) {
+        throw Error("servo config: control_mode 'csp' requires 'use_distributed_clocks' = true (CSP runs synchronous to SYNC0)");
     }
     if (!(max_motor_speed_rpm >= 0.0)) {  // also rejects NaN
         throw Error("servo config: 'max_motor_speed_rpm' must be >= 0");
@@ -50,6 +61,9 @@ void ServoConfig::validate() const {
     }
     if (!(counts_per_rev > 0.0)) {
         throw Error("servo config: 'counts_per_rev' must be > 0");
+    }
+    if (max_accel_rpm_per_s < 0.0) {
+        throw Error("servo config: 'max_accel_rpm_per_s' must be >= 0");
     }
     if (position_tolerance_counts < 0) {
         throw Error("servo config: 'position_tolerance_counts' must be >= 0");
