@@ -28,6 +28,11 @@ class A6ServoDriver final : public ServoController {
    public:
     // Inherit the generic constructors verbatim -- the A6 adds no config, only behavior.
     using ServoController::ServoController;
+    // Validated in profile mode; it stays PP/PV unless control_mode says otherwise.
+    static constexpr MotionModeKind kDefaultMotionMode = MotionModeKind::Profile;
+    MotionModeKind default_motion_mode() const noexcept override {
+        return kDefaultMotionMode;
+    }
 
    protected:
     std::optional<ethercat::SdoWrite> vendor_fault_reset_sdo() const override {

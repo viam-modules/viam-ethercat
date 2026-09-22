@@ -27,6 +27,7 @@ ServoConfig good_config() {
     c.target_loop_rate_hz = 1000;
     c.rt_priority = 80;
     c.command_queue_capacity = 64;
+    c.use_distributed_clocks = true;  // the default control mode (csp) requires it
     return c;
 }
 
@@ -34,6 +35,28 @@ ServoConfig good_config() {
 
 TEST("ServoConfig::validate accepts a good config") {
     good_config().validate();  // must not throw
+}
+
+TEST("control_mode csp requires distributed clocks; profile does not") {
+    ServoConfig c = good_config();
+    c.use_distributed_clocks = false;
+    CHECK_THROWS_MSG(c.validate(), Error, "use_distributed_clocks");
+    c.motion_mode = ethercat::servo::MotionModeKind::Profile;
+    c.validate();  // must not throw
+}
+
+TEST("the RxPDO map follows the control mode; the TxPDO map does not") {
+    ServoConfig c = good_config();
+    c.set_fixed_pdo_map();
+    const auto& cyclic = c.rxpdo.entries.at(0x1600);
+    CHECK_EQ(cyclic.size(), std::size_t{2});  // 0x6040 + 0x607A, no mode byte
+    CHECK_EQ(cyclic[1].index, std::uint16_t{0x607A});
+    c.motion_mode = ethercat::servo::MotionModeKind::Profile;
+    c.set_fixed_pdo_map();
+    const auto& profile = c.rxpdo.entries.at(0x1600);
+    CHECK_EQ(profile.size(), std::size_t{5});
+    CHECK_EQ(profile[1].index, std::uint16_t{0x6060});
+    CHECK_EQ(c.txpdo.entries.at(0x1A00).size(), std::size_t{6});
 }
 
 TEST("ServoConfig::validate rejects each invalid field with clear text") {

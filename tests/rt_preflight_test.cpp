@@ -26,6 +26,7 @@ namespace {
 
 ServoConfig valid_config() {
     ServoConfig c;
+    c.motion_mode = ethercat::servo::MotionModeKind::Profile;  // no DC needed for these tests
     // An interface name that can never open, so a preflight that wrongly passes fails later
     // with a DIFFERENT (NIC) error text -- the assertions below tell the two apart.
     c.ifname = "no-such-nic0";

@@ -1,7 +1,6 @@
 #include "ethercat/master.hpp"
 
 #include <algorithm>
-#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <format>
@@ -16,7 +15,6 @@ namespace ethercat {
 
 namespace {
 
-constexpr std::uint16_t kModesOfOp = 0x6060;  // CiA402 modes-of-operation (U8): PP=1, PV=3; SDO-set in PRE-OP
 constexpr long kNsPerSec = 1'000'000'000L;
 
 std::uint32_t field_key(std::uint16_t index, std::uint8_t sub) noexcept {
@@ -134,30 +132,25 @@ std::map<std::uint32_t, Master::MappedField> Master::build_field_table(std::uint
 void Master::configure() {
     // Maps are writable only in PRE-OP and are not stored in EEPROM, so this runs
     // every configure() / power-on.
-    ETHERCAT_LOG_INFO("configure", "phase 1/5: all slaves -> PRE-OP");
+    ETHERCAT_LOG_INFO("configure", "phase 1/4: all slaves -> PRE-OP");
     backend_->request_state(0, EcatState::PreOp);
 
     for (const SlaveConfig& sc : config_.slaves) {
-        ETHERCAT_LOG_INFO("configure", "phase 2/5: slave {}: applying RxPDO map (SM2)", sc.slave_id);
+        ETHERCAT_LOG_INFO("configure", "phase 2/4: slave {}: applying RxPDO map (SM2)", sc.slave_id);
         apply_pdo_map(*backend_, sc.slave_id, sc.rxpdo, PdoDirection::Rx);
-        ETHERCAT_LOG_INFO("configure", "phase 2/5: slave {}: applying TxPDO map (SM3)", sc.slave_id);
+        ETHERCAT_LOG_INFO("configure", "phase 2/4: slave {}: applying TxPDO map (SM3)", sc.slave_id);
         apply_pdo_map(*backend_, sc.slave_id, sc.txpdo, PdoDirection::Tx);
-        // Set modes-of-operation (0x6060, U8) via SDO; it is not mapped cyclically. A drive
-        // left in mode 0 never moves. PP=1 / PV=3, from the configured default_mode.
-        const std::array<std::byte, 1> mode{static_cast<std::byte>(static_cast<std::uint8_t>(sc.default_mode))};
-        ETHERCAT_LOG_INFO("configure", "phase 3/5: slave {}: 0x6060 <- {} via SDO", sc.slave_id, static_cast<int>(sc.default_mode));
-        backend_->sdo_write(sc.slave_id, kModesOfOp, 0, mode);
     }
 
     // DC SYNC0 cycle = loop period (validated against the drive's granularity in the ctor).
     const auto cycle_ns = static_cast<std::uint32_t>(kNsPerSec / static_cast<long>(config_.target_loop_rate_hz));
 
     if (config_.use_distributed_clocks) {
-        ETHERCAT_LOG_INFO("configure", "phase 4/5: arming SYNC0 in PRE-OP (cycle {} ns)", cycle_ns);
+        ETHERCAT_LOG_INFO("configure", "phase 3/4: arming SYNC0 in PRE-OP (cycle {} ns)", cycle_ns);
         backend_->arm_dc_sync(cycle_ns, config_.dc_sync0_shift_ns);
     }
 
-    ETHERCAT_LOG_INFO("configure", "phase 4/5: mapping the process image (config_map_group)");
+    ETHERCAT_LOG_INFO("configure", "phase 3/4: mapping the process image (config_map_group)");
     backend_->map_process_data();
     expected_wkc_ = backend_->expected_wkc();
 
@@ -210,11 +203,11 @@ void Master::configure() {
     }
 
     if (config_.use_distributed_clocks) {
-        ETHERCAT_LOG_INFO("configure", "phase 4/5: configdc (reference clock, offsets, propagation delays)");
+        ETHERCAT_LOG_INFO("configure", "phase 3/4: configdc (reference clock, offsets, propagation delays)");
         backend_->configure_dc_configdc();
     }
 
-    ETHERCAT_LOG_INFO("configure", "phase 5/5: all slaves -> SAFE-OP");
+    ETHERCAT_LOG_INFO("configure", "phase 4/4: all slaves -> SAFE-OP");
     backend_->request_state(0, EcatState::SafeOp);
 
     dc_enabled_ = config_.use_distributed_clocks;
