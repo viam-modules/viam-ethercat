@@ -127,15 +127,26 @@ ethercat::log::Level to_library_level(viam::sdk::log_level lvl) noexcept {
     return ethercat::log::Level::Info;
 }
 
-ServoConfig config_from_attrs(const ProtoStruct& attrs) {
+ServoConfig config_from_attrs(const ProtoStruct& attrs, ethercat::servo::MotionModeKind default_mode) {
     ServoConfig c;
     c.ifname = req_str(attrs, "interface");
     c.slave_id = static_cast<std::uint16_t>(opt_num(attrs, "slave", 1.0));
-    // No control_mode attribute: the driver is always switch-capable (each API call ensures its own
-    // mode at runtime). No rxpdo/txpdo attributes either: the driver defines one fixed superset PDO
-    // map (ServoConfig::set_fixed_pdo_map(), applied in validated()).
+    // "csp" (default for the generic model) or "profile" (PP/PV). The driver derives the PDO map from
+    // it and selects it on the drive by SDO at start. No rxpdo/txpdo attributes: the maps are driver-defined.
+    c.motion_mode = default_mode;
+    if (const auto mode = opt_attr<std::string>(attrs, "control_mode")) {
+        if (*mode == "csp") {
+            c.motion_mode = ethercat::servo::MotionModeKind::CyclicPosition;
+        } else if (*mode == "profile") {
+            c.motion_mode = ethercat::servo::MotionModeKind::Profile;
+        } else {
+            throw Error("config attribute 'control_mode' must be \"csp\" or \"profile\" (got '" + *mode + "')");
+        }
+    }
 
     c.max_motor_speed_rpm = req_num(attrs, "max_rpm");
+    // Ramp acceleration of the master-side trajectory in CSP; 0/absent = max_rpm per second. Ignored in PP.
+    c.max_accel_rpm_per_s = opt_num(attrs, "max_acceleration_rpm_per_s", 0.0);
     c.counts_per_rev = req_num(attrs, "counts_per_rev");
     c.motor_rated_current_amps = req_num(attrs, "motor_rated_current_amps");
     c.gear_ratio = opt_num(attrs, "gear_ratio", 1.0);
@@ -168,7 +179,7 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs) {
 // ServoMotor stays subclass-agnostic (reconfigure() rebuilds the master in place, preserving the type).
 template <class Controller>
 std::unique_ptr<ServoController> build_controller(const ResourceConfig& cfg) {
-    return std::make_unique<Controller>(config_from_attrs(cfg.attributes()));
+    return std::make_unique<Controller>(config_from_attrs(cfg.attributes(), Controller::kDefaultMotionMode));
 }
 
 bool command_flag(const ProtoStruct& command, const char* key) {
@@ -231,8 +242,8 @@ std::vector<ProtoValue> decode_drive_modes(std::uint32_t bits) {
 
 }  // namespace
 
-ServoConfig parse_servo_config(const ProtoStruct& attributes) {
-    return config_from_attrs(attributes);
+ServoConfig parse_servo_config(const ProtoStruct& attributes, ethercat::servo::MotionModeKind default_mode) {
+    return config_from_attrs(attributes, default_mode);
 }
 
 const ModelFamily& ServoMotor::model_family() {
@@ -258,20 +269,20 @@ std::vector<std::shared_ptr<ModelRegistration>> ServoMotor::create_model_registr
             [](const auto& /*deps*/, const auto& cfg) {
                 return std::make_shared<ServoMotor>(cfg.name(), build_controller<ServoController>(cfg));
             },
-            [](const auto& cfg) { return ServoMotor::validate(cfg); }),
+            [](const auto& cfg) { return ServoMotor::validate(cfg, ServoController::kDefaultMotionMode); }),
         std::make_shared<ModelRegistration>(
             API::get<Motor>(),
             a6_model(),  // viam:ethercat:a6-servo -- A6ServoDriver subclass
             [](const auto& /*deps*/, const auto& cfg) {
                 return std::make_shared<ServoMotor>(cfg.name(), build_controller<A6ServoDriver>(cfg));
             },
-            [](const auto& cfg) { return ServoMotor::validate(cfg); }),
+            [](const auto& cfg) { return ServoMotor::validate(cfg, A6ServoDriver::kDefaultMotionMode); }),
     };
 }
 
-std::vector<std::string> ServoMotor::validate(const ResourceConfig& cfg) {
-    (void)parse_servo_config(cfg.attributes());  // throws Error on any problem
-    return {};                                   // a motor has no dependencies
+std::vector<std::string> ServoMotor::validate(const ResourceConfig& cfg, ethercat::servo::MotionModeKind default_mode) {
+    (void)parse_servo_config(cfg.attributes(), default_mode);  // throws Error on any problem
+    return {};                                                 // a motor has no dependencies
 }
 
 ServoMotor::ServoMotor(const Dependencies& /*deps*/, const ResourceConfig& cfg)
@@ -306,7 +317,7 @@ void ServoMotor::install_logging(viam::sdk::log_level level) {
 void ServoMotor::reconfigure(const Dependencies& /*deps*/, const ResourceConfig& cfg) {
     // Validate before mutate: parse and validate the new config (throws) before any teardown. The
     // controller owns the stop->join->rebuild->restart lifecycle.
-    ServoConfig sc = parse_servo_config(cfg.attributes());
+    ServoConfig sc = parse_servo_config(cfg.attributes(), controller_->default_motion_mode());
     install_logging(cfg.get_log_level());
     controller_->reconfigure(std::move(sc));
 }
@@ -379,6 +390,7 @@ ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
         status.emplace("position", ProtoValue(controller_->position_revs()));
         status.emplace("is_disconnected", ProtoValue(controller_->is_disconnected()));
         status.emplace("last_error", ProtoValue(controller_->last_error()));
+        status.emplace("motion_mode", ProtoValue(std::string(controller_->motion_mode_name())));  // "PP" or "CSP"
         result.emplace("status", ProtoValue(std::move(status)));
     }
     // Standard-CiA402 SDO reads (no config, no override). On success, the converted value goes under
