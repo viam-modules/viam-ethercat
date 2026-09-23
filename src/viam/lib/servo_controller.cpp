@@ -1207,6 +1207,20 @@ std::size_t ServoController::sdo_read(std::uint16_t index, std::uint8_t sub, std
     return master_->sdo_read(config_.slave_id, index, sub, out);
 }
 
+void ServoController::sdo_write(std::uint16_t index, std::uint8_t sub, std::span<const std::byte> data) {
+    const std::shared_lock<std::shared_mutex> lk(api_mutex_);
+    if (master_ == nullptr || rt_runner_ == nullptr) {
+        throw Error("ServoController::sdo_write: not running -- call while operational (object " + std::to_string(index) + ":" +
+                    std::to_string(sub) + ")");
+    }
+    master_->sdo_write(config_.slave_id, index, sub, data);
+}
+
+bool ServoController::raw_sdo_allowed() const noexcept {
+    const std::shared_lock<std::shared_mutex> lk(api_mutex_);
+    return config_.allow_raw_sdo;
+}
+
 double ServoController::rated_current_amps() const noexcept {
     const std::shared_lock<std::shared_mutex> lk(api_mutex_);
     return config_.motor_rated_current_amps;

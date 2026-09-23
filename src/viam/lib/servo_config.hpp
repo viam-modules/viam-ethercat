@@ -32,6 +32,9 @@ struct ServoConfig {
     std::string ifname;          // EtherCAT NIC
     std::uint16_t slave_id = 1;  // 1-based ring position
     MotionModeKind motion_mode = MotionModeKind::CyclicPosition;
+    // Enable the raw sdo_read/sdo_write do_command verbs (any object, typed). Off by default: a
+    // commissioning tool, not part of the standard-CiA402 surface.
+    bool allow_raw_sdo = false;
     // The PDO maps are driver-defined per motion_mode (set_fixed_pdo_map()), never user-supplied.
     ethercat::PdoMap rxpdo;  // command map (0x1C12): cw + 0x607A (cyclic) | cw + 0x6060 + 0x607A + 0x6081 + 0x60FF (profile)
     ethercat::PdoMap txpdo;  // feedback map (0x1C13): 0x603F,0x6041,0x6061,0x6064,0x606C,0x6077

@@ -297,7 +297,7 @@ void SoemBackend::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8
         const SdoOutcome outcome = drain_sdo_errors(&impl_->ctx);
         const std::string msg = describe_sdo_failure("write to", slave, index, sub, data.size(), wkc, outcome);
         ETHERCAT_LOG_DEBUG("sdo", "{}", msg);  // the thrown SdoError carries the text
-        throw SdoError(msg);
+        throw SdoError(msg, outcome.aborted ? outcome.abort_code : 0U);
     }
     ETHERCAT_LOG_DEBUG("sdo", "write slave {} 0x{:04X}:{:02X} ok (wkc {})", slave, index, sub, wkc);
 }
@@ -314,7 +314,7 @@ std::size_t SoemBackend::sdo_read(std::uint16_t slave, std::uint16_t index, std:
         const SdoOutcome outcome = drain_sdo_errors(&impl_->ctx);
         const std::string msg = describe_sdo_failure("read from", slave, index, sub, out.size(), wkc, outcome);
         ETHERCAT_LOG_DEBUG("sdo", "{}", msg);  // the thrown SdoError carries the text
-        throw Error(msg);
+        throw SdoError(msg, outcome.aborted ? outcome.abort_code : 0U);
     }
     const std::size_t got = static_cast<std::size_t>(size < 0 ? 0 : size);
     ETHERCAT_LOG_DEBUG("sdo",

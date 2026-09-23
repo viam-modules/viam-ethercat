@@ -178,6 +178,10 @@ class ServoController : public SlaveControl {
                          std::uint8_t sub,
                          std::span<std::byte> out,
                          std::chrono::milliseconds timeout = std::chrono::milliseconds(200));
+    // One-shot CoE download on the caller's (non-RT) thread while the run is live; same gating as
+    // sdo_read. Throws Error if not running, SdoError (with the abort code) if the drive refuses.
+    void sdo_write(std::uint16_t index, std::uint8_t sub, std::span<const std::byte> data);
+    bool raw_sdo_allowed() const noexcept;  // the allow_raw_sdo attribute
     // Motor rated current (amps), for the module's per-mille to amps conversion. Read under the
     // shared lock (reconfigure() rewrites config_ under the exclusive lock).
     double rated_current_amps() const noexcept;

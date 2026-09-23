@@ -34,6 +34,7 @@ Add a motor component with one of the models above. Attributes:
 | `counts_per_rev` | yes | — | encoder counts per motor revolution |
 | `motor_rated_current_amps` | yes | — | nameplate rated current |
 | `slave` | no | 1 | 1-based position of the drive on the bus |
+| `allow_raw_sdo` | no | false | enables the `sdo_read` / `sdo_write` do_command verbs (any object, typed); a commissioning tool, off by default |
 | `control_mode` | no | `csp` (`profile` for `a6-servo`) | `csp`: cyclic synchronous position, master-side trajectory, needs `use_distributed_clocks`; `profile`: PP for `go_to`/`go_for`, PV for `set_rpm`, the drive generates the trajectory |
 | `gear_ratio` | no | 1.0 | motor revolutions per output revolution |
 | `position_tolerance_counts` | no | counts_per_rev/720 | "reached/stopped" stability band |
@@ -116,6 +117,12 @@ matter:
   (`"log_configuration": {"level": "debug"}` on the motor). `debug` traces every SDO (object,
   payload, decoded abort) and AL state request during bring-up; `info` prints one line per
   bring-up phase and one per fault-code change.
+- Raw SDO access, when `allow_raw_sdo` is true: `{"sdo_read": {"index": "0x2A9C", "sub": 4, "type": "u16"}}`
+  and `{"sdo_write": {"index": "0x2A9C", "sub": 4, "type": "u16", "value": 2, "verify": true}}`. Types:
+  `u8 i8 u16 i16 u32 i32 u64 i64 string bytes`; values are numbers or `"0x.."` / hex-byte strings. A drive
+  refusal comes back as `{"ok": false, "abort_code": "0x06090030", "error": "..."}`. Writes are refused
+  while the motor moves (unless `"force": true`) and for objects the driver owns (0x6040, 0x6060, 0x607A,
+  0x6081, 0x60FF, the PDO map). Every raw write is logged.
 - `do_command` verbs: `status`, `fault_reset`, `enable`, `disable`,
   `get_motor_voltage`, `get_motor_current_actual_value`,
   `get_motor_drive_modes`.
