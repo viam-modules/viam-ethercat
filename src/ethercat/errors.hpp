@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 
@@ -50,7 +51,13 @@ class PdoMappingError : public Error {
 // re-tag a mapping-object abort as a PdoMappingError.
 class SdoError : public Error {
    public:
-    explicit SdoError(const std::string& what) : Error(what) {}
+    explicit SdoError(const std::string& what, std::uint32_t abort_code = 0) : Error(what), abort_code_(abort_code) {}
+    std::uint32_t abort_code() const noexcept {  // CoE abort code; 0 when the mailbox gave no reply
+        return abort_code_;
+    }
+
+   private:
+    std::uint32_t abort_code_ = 0;
 };
 
 }  // namespace ethercat
