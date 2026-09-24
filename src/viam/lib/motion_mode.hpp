@@ -150,8 +150,8 @@ class ProfilePositionMode final : public MotionMode {
 class CyclicPositionMode final : public MotionMode {
    public:
     // dt_s: cycle period; max_accel_cps2: ramp acceleration; max_vel_cps: the ceiling the shutdown ramp starts from.
-    CyclicPositionMode(double dt_s, double max_accel_cps2, double max_vel_cps) noexcept
-        : dt_s_(dt_s), accel_(max_accel_cps2), max_vel_cps_(max_vel_cps) {}
+    CyclicPositionMode(double dt_s, double max_accel_cps2, double max_vel_cps, std::uint32_t quick_stop_decel) noexcept
+        : dt_s_(dt_s), accel_(max_accel_cps2), max_vel_cps_(max_vel_cps), quick_stop_decel_(quick_stop_decel) {}
 
     const char* name() const noexcept override {
         return "CSP";
@@ -191,7 +191,8 @@ class CyclicPositionMode final : public MotionMode {
     const double dt_s_;
     const double accel_;
     const double max_vel_cps_;
-    FieldLocation f_target_pos_{};  // 0x607A (required)
+    const std::uint32_t quick_stop_decel_;  // 0x6085, counts/s^2; 0 = leave the drive's value
+    FieldLocation f_target_pos_{};          // 0x607A (required)
     TrapezoidGenerator generator_;
     bool positioning_ = true;  // last command: a positioning move (true) or a velocity run (false)
 };

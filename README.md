@@ -43,6 +43,7 @@ Add a motor component with one of the models above. Attributes:
 | `require_realtime` | no | true | hard-fail at load without SCHED_FIFO |
 | `rt_priority` | no | 80 | SCHED_FIFO priority (1..99) |
 | `emergency_stop_fault_code` | no | none | 0x603F value the drive reports while its emergency-stop input is engaged (e.g. `"0xFF3A"`); while present, `status` reports `emergency_stop: true`, motion calls fail with "emergency stop engaged", and no automatic fault-reset edges are sent (the `fault_reset` do_command still works, for a drive that latches the stop) |
+| `quick_stop_decel_rpm_per_s` | no | 0 (not configured) | deceleration written to the drive's 0x6085: its quick stop, its E-stop input ramp, and in `profile` mode the module's own `stop()`; in `profile` mode the drive must hold 0x605A = 2 |
 | `max_acceleration_rpm_per_s` | no | `max_rpm` per second | ramp acceleration of the master-side trajectory in `csp`; ignored in `profile` |
 
 ### Control mode

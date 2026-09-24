@@ -22,6 +22,7 @@
 #include "ethercat/errors.hpp"
 #include "ethercat/log.hpp"
 #include "ethercat/pdo_mapping.hpp"
+#include "ethercat/util.hpp"
 #include "viam/lib/a6_servo_driver.hpp"
 #include "viam/lib/sdo_codec.hpp"
 #include "viam/lib/servo_config.hpp"
@@ -168,6 +169,12 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs, ethercat::servo::MotionM
         }
         c.estop_fault_code = static_cast<std::uint16_t>(code);
     }
+    // Deceleration written to 0x6085 (the drive's quick stop, also its E-stop input ramp); 0/absent = not configured.
+    const double qs_rpm_s = opt_num(attrs, "quick_stop_decel_rpm_per_s", 0.0);
+    if (!(qs_rpm_s >= 0.0)) {
+        throw Error("config attribute 'quick_stop_decel_rpm_per_s' must be >= 0");
+    }
+    c.quick_stop_decel = static_cast<std::uint32_t>(ethercat::rpm_to_device_velocity(qs_rpm_s, c.counts_per_rev, c.gear_ratio));
 
     c.position_tolerance_counts = static_cast<std::int32_t>(opt_num(attrs, "position_tolerance_counts", 0.0));
 
