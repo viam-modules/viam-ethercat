@@ -96,6 +96,10 @@ matter:
 - On bus loss (cable pull, NIC down) the module stays alive: reads return
   fail-safe values, motion calls return a clear error, and the next motion call
   after the link returns rebuilds the connection automatically.
+- Log verbosity follows the component's log level in the machine config
+  (`"log_configuration": {"level": "debug"}` on the motor). `debug` traces every SDO (object,
+  payload, decoded abort) and AL state request during bring-up; `info` prints one line per
+  bring-up phase and one per fault-code change.
 - `do_command` verbs: `status`, `fault_reset`, `enable`, `disable`,
   `get_motor_voltage`, `get_motor_current_actual_value`,
   `get_motor_drive_modes`.

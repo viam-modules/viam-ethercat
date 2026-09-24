@@ -3,12 +3,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <utility>
 
 #include "ethercat/errors.hpp"
+#include "ethercat/log.hpp"
 #include "ethercat/pdo_buffer.hpp"
 #include "ethercat/realtime.hpp"
 #include "ethercat/soem_backend.hpp"
@@ -114,12 +114,12 @@ void ServoController::run_vendor_fault_reset() {
     try {
         master_->sdo_write(config_.slave_id, reset->index, reset->subindex, reset->data);
     } catch (const Error& e) {
-        (void)std::fprintf(stderr,
-                           "[servo] vendor fault-reset SDO (slave %u 0x%04X:%02X) failed (continuing): %s\n",
-                           static_cast<unsigned>(config_.slave_id),
-                           static_cast<unsigned>(reset->index),
-                           static_cast<unsigned>(reset->subindex),
-                           e.what());
+        ETHERCAT_LOG_WARN("servo",
+                          "slave {}: vendor fault-reset SDO {}:{:02X} failed (continuing): {}",
+                          config_.slave_id,
+                          hex(reset->index),
+                          reset->subindex,
+                          e.what());
     }
 }
 
@@ -145,6 +145,7 @@ void ServoController::start() {
     // operational" minutes later after the NIC was opened and bring-up ran. The probe runs on a
     // scratch thread (no process-wide side effects); the RT thread's realtime::setup() remains the
     // authoritative backstop (privileges could change between the probe and the spawn).
+    log_start_summary("start");
     if (config_.require_realtime && !realtime::sched_fifo_available(config_.rt_priority)) {
         throw Error(rt_unavailable_message(config_.rt_priority));
     }
@@ -159,6 +160,26 @@ void ServoController::start() {
     master_->init();
     master_->configure();  // -> SAFE-OP (may throw Error; the SDK retries)
     bring_up();            // resolve, clear errors, and reach OP, with bounded retry
+}
+
+// One line naming the effective config a run starts from.
+void ServoController::log_start_summary(const char* what) const {
+    ETHERCAT_LOG_INFO("servo",
+                      "{}: interface '{}' slave {} loop {} Hz DC {} sync granularity {} ns require_realtime {} rt_priority {} "
+                      "counts/rev {} gear {} max_rpm {} quick_stop_decel {} log_level {}",
+                      what,
+                      config_.ifname,
+                      config_.slave_id,
+                      config_.target_loop_rate_hz,
+                      config_.use_distributed_clocks ? "on" : "off",
+                      config_.sync_cycle_granularity_ns,
+                      config_.require_realtime,
+                      config_.rt_priority,
+                      config_.counts_per_rev,
+                      config_.gear_ratio,
+                      config_.max_motor_speed_rpm,
+                      config_.quick_stop_decel,
+                      log::to_string(log::level()));
 }
 
 // Zero the per-run published atomics + RT-only working state (shared by start()/reconfigure()).
@@ -248,17 +269,14 @@ void ServoController::bring_up() {
             return;  // reached OP
         }
         if (attempt >= kMaxBringupAttempts) {
-            (void)std::fprintf(stderr,
-                               "[servo] slave %u: bring-up FAILED after %u attempts -- giving up (Degraded): %s\n",
-                               static_cast<unsigned>(config_.slave_id),
+            ETHERCAT_LOG_ERROR("servo",
+                               "slave {}: bring-up FAILED after {} attempts -- giving up (Degraded): {}",
+                               config_.slave_id,
                                attempt,
-                               last_error().c_str());
+                               last_error());
             return;  // Degraded: degraded_ and the AL/fault tier are already set by on_stop(BringupAborted)
         }
-        (void)std::fprintf(stderr,
-                           "[servo] slave %u: bring-up attempt %u failed -- clearing errors + retrying...\n",
-                           static_cast<unsigned>(config_.slave_id),
-                           attempt);
+        ETHERCAT_LOG_WARN("servo", "slave {}: bring-up attempt {} failed -- clearing errors + retrying", config_.slave_id, attempt);
         // Full recovery for the next attempt: drop the Runner (join the exited RT thread, close()->INIT)
         // and master, then rebuild (INIT bounce, PRE-OP settle, DC re-arm). Requests OP once next attempt.
         rt_runner_.reset();
@@ -315,6 +333,7 @@ void ServoController::reconfigure(ServoConfig config) {
     config_ = std::move(next);
 
     // Restart with the new config (same body as start(), lock already held).
+    log_start_summary("reconfigure");
     if (config_.require_realtime && !realtime::sched_fifo_available(config_.rt_priority)) {
         throw Error(rt_unavailable_message(config_.rt_priority));
     }
@@ -347,6 +366,16 @@ void ServoController::resolve_fields() {
     // Available when the map carries 0x6060 and 0x607A. The runtime halt handler further gates
     // on the current intent being PV (a PP halt already holds in PP, no switch).
     pv_hold_capable_ = f_mode_wr_.has_value() && master_->try_resolve_rx<cia402::TargetPosition>(s).has_value();
+    ETHERCAT_LOG_DEBUG("servo",
+                       "slave {}: resolved fields: ctrlword@{} statusword@{} actual@{} fault_code@{} velocity@{} mode_wr@{} mode_disp@{}",
+                       s,
+                       f_ctrlword_.byte_offset,
+                       f_statusword_.byte_offset,
+                       f_actual_.byte_offset,
+                       f_fault_code_ ? static_cast<long>(f_fault_code_->byte_offset) : -1L,
+                       f_velocity_actual_ ? static_cast<long>(f_velocity_actual_->byte_offset) : -1L,
+                       f_mode_wr_ ? static_cast<long>(f_mode_wr_->byte_offset) : -1L,
+                       f_mode_disp_ ? static_cast<long>(f_mode_disp_->byte_offset) : -1L);
 
     // Size the position-stability window to ~20 ms at the loop rate (>= 3 cycles), reset it.
     // Pre-allocated here (non-RT, pre-spawn) so the RT loop never allocates. Re-sized on each start/reconfigure.
@@ -361,11 +390,10 @@ void ServoController::resolve_fields() {
     // bring-up (non-RT, once) rather than let an operator find out the hard way. Not a hard
     // requirement, just discoverable.
     if (config_.quick_stop_decel == 0) {
-        (void)std::fprintf(stderr,
-                           "[servo] slave %u: quick_stop_decel not set -> STOP is an UNCONTROLLED disable-voltage "
-                           "coast (safe, but a load-holding axis will drift/drop). Set quick_stop_decel (0x6085) for a "
-                           "controlled ramp-stop.\n",
-                           static_cast<unsigned>(s));
+        ETHERCAT_LOG_WARN("servo",
+                          "slave {}: quick_stop_decel not set -> STOP is an uncontrolled disable-voltage coast (safe, but a "
+                          "load-holding axis will drift/drop); set quick_stop_decel (0x6085) for a controlled ramp-stop",
+                          s);
     }
 }
 
@@ -591,10 +619,24 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
             const auto echo = ctx.load<cia402::ModeDisplay::type>(*f_mode_disp_);
             if (echo == want) {
                 mode_gate_ = ModeGate::Passed;
+                // RT-context log (one-shot; the RT rule in log.hpp)
+                ETHERCAT_LOG_INFO("servo",
+                                  "slave {}: mode-echo gate PASSED at {}: 0x6061 = {} == commanded {}",
+                                  config_.slave_id,
+                                  to_string(dev),
+                                  static_cast<int>(echo),
+                                  static_cast<int>(want));
             } else {
                 mode_gate_ = ModeGate::Failed;
                 latched_ctrl_error_ = RtError::ModeMismatch;
                 rt_error_.store(RtError::ModeMismatch, std::memory_order_release);
+                // RT-context log (one-shot; the RT rule in log.hpp)
+                ETHERCAT_LOG_WARN("servo",
+                                  "slave {}: mode-echo gate FAILED at {}: 0x6061 = {} != commanded {} -- staying de-energized",
+                                  config_.slave_id,
+                                  to_string(dev),
+                                  static_cast<int>(echo),
+                                  static_cast<int>(want));
             }
         }
         if (mode_gate_ == ModeGate::Failed) {
@@ -602,6 +644,8 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         }
         if (dev == Cia402State::OperationEnabled) {
             lifecycle_ = Operational{};
+            // RT-context log (one-shot; the RT rule in log.hpp)
+            ETHERCAT_LOG_INFO("servo", "slave {}: drive reached OperationEnabled (energized) at cycle {}", config_.slave_id, ctx.cycle());
         }
         return fsm_.step(status, Cia402State::OperationEnabled);
     }
@@ -898,6 +942,24 @@ void ServoController::step(CycleContext& ctx) noexcept {
                            : static_cast<std::int32_t>(static_cast<std::int64_t>(actual - prev_actual_) * config_.target_loop_rate_hz);
     prev_actual_ = actual;
 
+    // One-shot on every 0x603F change (fault onset and clear) with the context that explains it.
+    if (f_fault_code_) {
+        const auto fc = ctx.load<cia402::FaultCode::type>(*f_fault_code_);
+        if (fc != last_logged_fault_code_) {
+            // RT-context log (one-shot; the RT rule in log.hpp)
+            ETHERCAT_LOG_INFO("servo",
+                              "slave {}: 0x603F {} -> {} at cycle {} (statusword 0x{:04X}, 0x6061 echo {}, last cw 0x{:04X})",
+                              config_.slave_id,
+                              hex(last_logged_fault_code_),
+                              hex(fc),
+                              ctx.cycle(),
+                              status.raw,
+                              f_mode_disp_ ? static_cast<int>(ctx.load<cia402::ModeDisplay::type>(*f_mode_disp_)) : -1,
+                              last_cw_);
+            last_logged_fault_code_ = fc;
+        }
+    }
+
     const std::uint16_t cw = step_lifecycle(ctx, status, batch, actual);
     ctx.store<std::uint16_t>(f_ctrlword_, cw);
     last_cw_ = cw;
@@ -942,10 +1004,10 @@ void ServoController::on_stop(StopReason reason) noexcept {
         rt_error_.store(RtError::NotOperational, std::memory_order_release);
         state_.faulted.store(true, std::memory_order_release);
         degraded_.store(true, std::memory_order_release);  // bring-up failed -> Degraded (APIs throw via last_error())
-        // One-shot operator log line. Cold teardown path, so fprintf here is fine (not the hot loop).
-        (void)std::fprintf(stderr,
-                           "[servo] bring-up FAILED: drive not operational%s%s\n",
-                           al != 0 ? (" -- drive refused OP: AL " + hex(al) + " (" + al_msg + ")").c_str() : "",
+        ETHERCAT_LOG_ERROR("servo",
+                           "slave {}: bring-up FAILED: drive not operational{}{}",
+                           config_.slave_id,
+                           al != 0 ? " -- drive refused OP: AL " + hex(al) + " (" + al_msg + ")" : std::string(),
                            (al == 0x0027 && !config_.use_distributed_clocks)
                                ? " -- freerun not supported; this drive requires use_distributed_clocks=true"
                                : "");
@@ -1020,7 +1082,7 @@ void ServoController::maybe_recover_bus() {
         bus_lost_.store(true, std::memory_order_release);
         throw Error("bus lost and recovery failed (" + cause + ") -- will retry on the next motion call");
     }
-    (void)std::fprintf(stderr, "[servo] bus recovered -- drive back to OPERATIONAL\n");
+    ETHERCAT_LOG_INFO("servo", "slave {}: bus recovered -- drive back to OPERATIONAL", config_.slave_id);
 }
 
 void ServoController::set_rpm(double rpm) {

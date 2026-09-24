@@ -6,17 +6,21 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include <viam/sdk/common/proto_value.hpp>
+#include <viam/sdk/log/logging.hpp>
 
 #include "ethercat/cia402.hpp"
 #include "ethercat/errors.hpp"
+#include "ethercat/log.hpp"
 #include "ethercat/pdo_mapping.hpp"
 #include "viam/lib/a6_servo_driver.hpp"
 #include "viam/lib/servo_config.hpp"
@@ -63,6 +67,64 @@ std::string req_str(const ProtoStruct& attrs, const std::string& key) {
         throw Error("required config attribute '" + key + "' is missing");
     }
     return *v;
+}
+
+// Forwards the library log to the SDK's resource logger, so lines carry the component name and honor
+// its app-configured log level instead of arriving as raw stderr (which the RDK files as errors).
+class SdkLogSink final : public ethercat::log::Sink {
+   public:
+    explicit SdkLogSink(const viam::sdk::Resource& resource) noexcept : resource_(resource) {}
+    void write(ethercat::log::Level level, std::string_view tag, std::string_view message, ethercat::log::Origin origin) noexcept override {
+        try {
+            // VIAM_RESOURCE_LOG stamps its own __FILE__/__LINE__; stamp the library's instead.
+            BOOST_LOG_SEV(viam::sdk::log_detail::logger_access::logger(resource_), to_sdk_level(level))
+                << boost::log::add_value(viam::sdk::attr_file_type{}, viam::sdk::log_detail::trim_filename(origin.file))
+                << boost::log::add_value(viam::sdk::attr_line_type{}, origin.line) << tag << ": " << message;
+        } catch (...) {
+            // A logging failure must never propagate into the RT path; keep the line visible on stderr.
+            (void)std::fprintf(stderr,
+                               "[ethercat] %s %.*s: %.*s (SDK logger unavailable)\n",
+                               ethercat::log::to_string(level),
+                               static_cast<int>(tag.size()),
+                               tag.data(),
+                               static_cast<int>(message.size()),
+                               message.data());
+        }
+    }
+
+   private:
+    static viam::sdk::log_level to_sdk_level(ethercat::log::Level level) noexcept {
+        switch (level) {
+            case ethercat::log::Level::Debug:
+                return viam::sdk::log_level::debug;
+            case ethercat::log::Level::Info:
+                return viam::sdk::log_level::info;
+            case ethercat::log::Level::Warn:
+                return viam::sdk::log_level::warn;
+            case ethercat::log::Level::Error:
+                return viam::sdk::log_level::error;
+        }
+        return viam::sdk::log_level::info;
+    }
+
+    const viam::sdk::Resource& resource_;
+};
+
+ethercat::log::Level to_library_level(viam::sdk::log_level lvl) noexcept {
+    using viam::sdk::log_level;
+    switch (lvl) {
+        case log_level::trace:
+        case log_level::debug:
+            return ethercat::log::Level::Debug;
+        case log_level::info:
+            return ethercat::log::Level::Info;
+        case log_level::warn:
+            return ethercat::log::Level::Warn;
+        case log_level::error:
+        case log_level::fatal:
+            return ethercat::log::Level::Error;
+    }
+    return ethercat::log::Level::Info;
 }
 
 ServoConfig config_from_attrs(const ProtoStruct& attrs) {
@@ -213,15 +275,17 @@ std::vector<std::string> ServoMotor::validate(const ResourceConfig& cfg) {
 }
 
 ServoMotor::ServoMotor(const Dependencies& /*deps*/, const ResourceConfig& cfg)
-    : Motor(cfg.name()), controller_(build_controller<ServoController>(cfg)) {
+    : Motor(cfg.name()), log_sink_(std::make_shared<SdkLogSink>(*this)), controller_(build_controller<ServoController>(cfg)) {
+    install_logging(cfg.get_log_level());
     controller_->start();
 }
 
 ServoMotor::ServoMotor(std::string name, std::unique_ptr<ServoController> controller)
-    : Motor(std::move(name)), controller_(std::move(controller)) {
+    : Motor(std::move(name)), log_sink_(std::make_shared<SdkLogSink>(*this)), controller_(std::move(controller)) {
     if (!controller_) {
         throw Error("ServoMotor: null controller");
     }
+    install_logging(viam::sdk::log_level::info);
     controller_->start();
 }
 
@@ -229,12 +293,21 @@ ServoMotor::~ServoMotor() {
     if (controller_) {
         controller_->stop();  // idempotent; joins the RT thread
     }
+    ethercat::log::clear_sink(log_sink_.get());  // after the RT thread is gone: nothing of ours logs any more
+}
+
+// The library log is process-wide; the most recently configured motor owns it (one motor per NIC
+// is the expected deployment). Its level follows the component's app-configured log level.
+void ServoMotor::install_logging(viam::sdk::log_level level) {
+    ethercat::log::set_level(to_library_level(level));
+    ethercat::log::set_sink(log_sink_);
 }
 
 void ServoMotor::reconfigure(const Dependencies& /*deps*/, const ResourceConfig& cfg) {
     // Validate before mutate: parse and validate the new config (throws) before any teardown. The
     // controller owns the stop->join->rebuild->restart lifecycle.
     ServoConfig sc = parse_servo_config(cfg.attributes());
+    install_logging(cfg.get_log_level());
     controller_->reconfigure(std::move(sc));
 }
 

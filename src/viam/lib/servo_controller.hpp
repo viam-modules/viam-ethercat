@@ -264,6 +264,7 @@ class ServoController : public SlaveControl {
     // Reach OP with bounded retry (clear errors and rebuild the master between attempts); Degraded
     // after kMaxBringupAttempts. Shared by start()/reconfigure() (master_ built to SAFE-OP).
     void bring_up();
+    void log_start_summary(const char* what) const;
     // One bring-up attempt: start the RT pump and bounded-poll the async outcome. true = reached OP.
     bool attempt_bringup();
     // Reset per-run state and construct, attach, and start the one-shot Runner; on a start-time
@@ -364,6 +365,7 @@ class ServoController : public SlaveControl {
     // --- RT-only working state (single-thread; plain members, no atomics or locks). Touched
     // exclusively by the RT loop and the lifecycle step()s. ---
     std::uint16_t last_cw_ = 0;                 // for the fault-reset rising-edge re-arm
+    std::uint16_t last_logged_fault_code_ = 0;  // RT-only: one-shot log on every 0x603F change
     std::uint32_t reset_cycles_remaining_ = 0;  // Resetting-window countdown, RT-only
     std::uint32_t clear_streak_ = 0;            // consecutive dev!=Fault cycles in Resetting (RT-only)
     std::int32_t target_counts_ = 0;            // latched PP target

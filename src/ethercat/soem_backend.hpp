@@ -74,6 +74,10 @@ class SoemBackend final {
     void set_state(std::uint16_t slave, EcatState target) noexcept;
     void reack_op(std::uint16_t slave) noexcept;
     EcatState slave_state(std::uint16_t slave) const;
+    // Re-read every slave's AL state and status code (ecx_readstate, blocking frames on the
+    // thread-safe port). The RT loop never polls AL state, so this is how a cold path notices a slave
+    // that fell back to SAFE-OP with an error while the WKC stayed full.
+    EcatState refresh_slave_state(std::uint16_t slave);
     std::uint16_t al_status_code(std::uint16_t slave) const noexcept;  // cached ESC AL status code
     static std::string describe_al_code(std::uint16_t code);           // SOEM string for a latched code
     void configure_dc_configdc();
