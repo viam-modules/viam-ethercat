@@ -7,16 +7,6 @@
 
 namespace ethercat::servo {
 
-const char* to_string(ControlMode mode) noexcept {
-    switch (mode) {
-        case ControlMode::ProfilePosition:
-            return "PP";
-        case ControlMode::ProfileVelocity:
-            return "PV";
-    }
-    return "?";
-}
-
 void ServoConfig::set_fixed_pdo_map() {
     // The one fixed driver-defined superset (standard CiA402 objects only). Always switch-capable
     // (0x6060 mapped) so any API call can ensure PP or PV at runtime. Unconditional: no per-mode

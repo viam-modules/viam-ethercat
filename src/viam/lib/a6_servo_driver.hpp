@@ -44,9 +44,8 @@ class A6ServoDriver final : public ServoController {
     // signal is unusable here. Use the position-stability heuristic instead: a PP move has reached once
     // the actual is within tolerance of the target and the shaft is position-stable. (The base already
     // advanced the stability ring this cycle, so compose the two booleans, don't re-sample.)
-    bool reached_target(bool pos_near_target, bool pos_stable, ethercat::Status status) noexcept override {
-        (void)status;
-        return pos_near_target && pos_stable;
+    bool target_reached_bit_usable() const noexcept override {
+        return false;  // the mode decides from position tolerance and rest instead
     }
 
    private:

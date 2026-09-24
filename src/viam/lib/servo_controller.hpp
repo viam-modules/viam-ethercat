@@ -8,8 +8,8 @@
 //   (a) fault-reset rising-edge re-arm (Cia402Fsm::step returns the level),
 //   (b) staleness -> fail-safe is_powered()/is_moving(),
 //   (c) is-moving/reached: the generic base trusts statusword bit 10; a device subclass
-//       overrides reached_target() for drives that tie bit 10 permanently high,
-//   (d) the runtime mode-switch orchestration (run_mode_switch), and
+//       overrides target_reached_bit_usable() for drives that tie bit 10 permanently high,
+//   (d) refusing a command that needs another CiA402 mode while the motor moves, and
 //   (e) the std::variant lifecycle FSM.
 //
 // Concurrency contract (load-bearing):
@@ -40,10 +40,10 @@
 #include <vector>
 
 #include "ethercat/cia402.hpp"
-#include "ethercat/cia402_sequencer.hpp"
 #include "ethercat/master.hpp"
 #include "ethercat/pdo_cache.hpp"
 #include "ethercat/runner.hpp"
+#include "viam/lib/motion_mode.hpp"
 #include "viam/lib/servo_config.hpp"
 
 namespace ethercat::servo {
@@ -63,6 +63,7 @@ struct ControllerState {
     std::atomic<std::int32_t> velocity{0};         // device velocity units
     std::atomic<bool> powered{false};              // OperationEnabled this cycle
     std::atomic<bool> moving{false};               // !move-complete
+    std::atomic<std::int8_t> mode_echo{0};         // 0x6061 this cycle (0 when not mapped)
     std::atomic<bool> faulted{false};  // drive/bus only: master_->fault() || status.fault() (move errors are the controller tier, not here)
     std::atomic<std::int32_t> fault_wkc{0};     // WKC at a live bus fault (payload; published before the wkc_faulted release)
     std::atomic<std::int32_t> expected_wkc{0};  // constant after start(); for last_error() (lock-free, master_-free)
@@ -175,6 +176,8 @@ class ServoController : public SlaveControl {
     // Motor rated current (amps), for the module's per-mille to amps conversion. Read under the
     // shared lock (reconfigure() rewrites config_ under the exclusive lock).
     double rated_current_amps() const noexcept;
+    // The motion mode selected at setup ("PP"), or "unselected" before the first start().
+    const char* motion_mode_name() const noexcept;
 
    protected:
     // --- Device seams. The base is the generic CiA402 servo driver; a device subclass
@@ -199,15 +202,11 @@ class ServoController : public SlaveControl {
     virtual std::string fault_description(std::uint16_t code) const;
     // Move-complete seam (the driver owns is-moving/reached, not the sequencer). Given this cycle's
     // "actual is within tolerance of target", "the shaft is position-stable", and the statusword,
-    // decide whether a PP move has reached. The generic base trusts the drive's statusword bit 10
-    // (target-reached); a device subclass overrides to `pos_near_target && pos_stable` for drives
-    // that tie bit 10 permanently high. RT-only (publish_state); position_stable() has already advanced
-    // its ring this cycle, so an override composes the two booleans and must not call
-    // position_stable() again.
-    virtual bool reached_target(bool pos_near_target, bool pos_stable, Status status) noexcept {
-        (void)pos_near_target;
-        (void)pos_stable;
-        return status.target_reached();
+    // Whether statusword bit 10 (target reached) is meaningful on this drive. The generic base trusts
+    // it; a device subclass returns false for drives that tie it permanently high, and the mode then
+    // decides completion from position tolerance and rest.
+    virtual bool target_reached_bit_usable() const noexcept {
+        return true;
     }
     // Noise-robust "shaft is still" heuristic: stable once the last N cycles' position range is
     // within position_tolerance_counts. Protected so a subclass reach override can compose it. Advances
@@ -224,9 +223,7 @@ class ServoController : public SlaveControl {
     struct Disabled {};
     using Lifecycle = std::variant<Init, Enabling, Operational, Resetting, Faulted, Disabled>;
 
-    // The PP new-set-point handshake lives in the shared Cia402Sequencer: the wrapper delegates the
-    // Operational healthy-path to sequencer_.step() and reads its handshake-idle and
-    // handshake-timeout signals (completion gate / abort).
+    // The mode-specific motion semantics live in motion_; the controller delegates to it.
 
     // Controller-tier fault reasons (this tier only; the bus WkcFault lives in
     // state_.wkc_faulted). The RT thread only stores the enum (no string alloc, no mutex on the
@@ -264,7 +261,6 @@ class ServoController : public SlaveControl {
     // Reach OP with bounded retry (clear errors and rebuild the master between attempts); Degraded
     // after kMaxBringupAttempts. Shared by start()/reconfigure() (master_ built to SAFE-OP).
     void bring_up();
-    void log_start_summary(const char* what) const;
     // One bring-up attempt: start the RT pump and bounded-poll the async outcome. true = reached OP.
     bool attempt_bringup();
     // Reset per-run state and construct, attach, and start the one-shot Runner; on a start-time
@@ -276,6 +272,12 @@ class ServoController : public SlaveControl {
     // thread is still the single port owner (after Master::configure(), before the RT thread
     // spawns). Best-effort: a failed clear is logged, not fatal. nullopt seam means no-op.
     void run_vendor_fault_reset();
+    // Construct motion_ for this run. Non-RT, pre-spawn, re-run on every bring-up attempt.
+    void select_motion_mode();
+    // Package this cycle's inputs for the mode (RT).
+    MotionFeedback feedback(CycleContext& ctx, Status status, std::int32_t actual) const noexcept;
+    void log_start_summary(const char* what) const;
+    void refuse_mode_switch_while_moving(const char* verb, MotionCommand cmd) const;
     // Inline bus recovery, called by the motion verbs BEFORE their shared lock: no-op unless
     // bus_lost_; otherwise (exclusive lock) tear down the dead run and attempt one full rebuild,
     // throwing a clear "will retry on the next motion call" Error while the bus stays gone.
@@ -310,12 +312,10 @@ class ServoController : public SlaveControl {
     std::optional<FieldLocation> f_fault_code_;       // 0x603F U16 drive error code (last_error gloss)
     std::optional<FieldLocation> f_velocity_actual_;  // 0x606C S32 velocity-actual (wire velocity; else estimate)
 
-    // The generic CiA402 motion sequencer (shared with the bench validation tool). The module's
-    // Operational healthy-path (enable-hold, PP handshake, PV stream, Halt) delegates here; the
-    // wrapper keeps the two-tier fault, fault-reset machine, completion generations, the driver
-    // mode-switch, and is-moving/reached. Constructed with just the quick-stop decel value.
-    Cia402Sequencer sequencer_;
-    // 0x6085 readback from sequencer_.configure (0 = quick-stop not configured). Written once by the
+    // The selected motion mode. Built pre-spawn, used by the RT loop; replaced only under the
+    // exclusive api_mutex_ with no Runner alive.
+    std::unique_ptr<MotionMode> motion_;
+    // 0x6085 readback from the mode's resolve (0 = quick-stop not configured). Written once by the
     // RT thread in on_configured (pre-steady), read by the non-RT velocity guard, so atomic.
     std::atomic<std::uint32_t> qs_decel_echoed_{0};
     // Effective PV/PP velocity ceiling (counts/s) derived from the teardown window: the max the
@@ -368,9 +368,6 @@ class ServoController : public SlaveControl {
     std::uint16_t last_logged_fault_code_ = 0;  // RT-only: one-shot log on every 0x603F change
     std::uint32_t reset_cycles_remaining_ = 0;  // Resetting-window countdown, RT-only
     std::uint32_t clear_streak_ = 0;            // consecutive dev!=Fault cycles in Resetting (RT-only)
-    std::int32_t target_counts_ = 0;            // latched PP target
-    std::uint32_t profile_vel_ = 0;             // latched PP profile velocity
-    std::int32_t pv_velocity_ = 0;              // latched PV target velocity
     std::int32_t prev_actual_ = 0;              // previous-cycle actual (instantaneous velocity estimate)
     bool first_cycle_ = true;                   // skip the velocity estimate on the first cycle
     // Noise-robust "stopped": a ring of the last N actual positions; stable when the window's range
@@ -379,39 +376,11 @@ class ServoController : public SlaveControl {
     std::size_t pos_hist_idx_ = 0;
     std::uint32_t pos_hist_filled_ = 0;  // entries written so far (window not "full" until == pos_hist_.size())
     // (position_stable() is declared protected above so a subclass reach override can compose it.)
-    // The Cia402 mode to command this cycle: the fixed config mode (PP/PV) or, for a switchable
-    // config, the current switch_intent_. RT-only (reads switch_intent_).
+    // The 0x6060 value to command this cycle: the selected mode's (a switching mode returns its
+    // intent). RT-only.
     Cia402Mode commanded_cia402_mode() const noexcept;
-    bool commanded_is_pp() const noexcept {
-        return commanded_cia402_mode() == Cia402Mode::ProfilePosition;
-    }
-    bool halted_ = false;  // sticky Stop: Halt stays asserted until a new motion command
-    // A PV motion-hold that holds zero velocity (bit 8) drifts under load, because the drive has
-    // no position loop in PV. When the map is switch-capable (0x6060 and 0x607A both RxPDO-mapped),
-    // a Halt of a PV move instead switches the drive to PP-at-current-counts (the driver mode-switch
-    // below, then a PP setpoint at the position latched at the halt) so the drive's position loop
-    // locks the shaft. pending_new_setpoint_ arms the sequencer's PP handshake for the hold without
-    // touching active_generation (the halt already failed the in-flight move). On a switch give-up
-    // the hold reverts to the interim PV-at-0 bit-8 hold (accept small drift, never de-energize).
-    // switch_intent_ is the current motion intent (RT-only), always meaningful. The command batch
-    // sets it (go_to/go_for -> PP, set_rpm -> PV). Default PP so the drive enables in PP.
-    // commanded_cia402_mode() maps it to the Cia402Mode the sequencer commands this cycle.
-    ControlMode switch_intent_ = ControlMode::ProfilePosition;
-    bool pv_hold_capable_ = false;  // set at resolve: 0x6060 and 0x607A both mapped
-    bool pv_hold_as_pp_ = false;    // sticky: currently holding a halted PV motor via PP-at-counts
-    // The driver signals a new set-point explicitly. Set true when a new PP target is adopted (or a
-    // PP hold begins); consumed on the next Operational sequencer step (a switch defers consumption --
-    // run_mode_switch returns before the consume, keeping this pending).
-    bool pending_new_setpoint_ = false;
-    // Driver-owned runtime mode-switch: when the drive's confirmed 0x6061 mode differs from the
-    // intent's Cia402 mode, the wrapper holds energized, brings the motor to rest (Stopping), commands
-    // the target mode via the sequencer and awaits the 0x6061 echo (Settling), then runs the target mode's
-    // motion body. Fail-safe give-up (never a throw). RT-only.
-    enum class SwitchPhase : std::uint8_t { None, Stopping, Settling };
-    SwitchPhase switch_phase_ = SwitchPhase::None;
-    std::uint32_t switch_cycles_ = 0;  // stop-first / settle window counter
-    bool at_rest_ = false;             // last publish_state's "stopped" verdict; run_mode_switch's stop-first gate reads it (1-cycle stale)
-    bool stop_at_rest_ = false;        // RT-only: drive reached SwitchOnDisabled during the stopping window -> teardown early-out
+    bool at_rest_ = false;       // last publish_state's "stopped" verdict; handed to the mode as MotionFeedback::at_rest
+    bool stop_at_rest_ = false;  // RT-only: drive reached SwitchOnDisabled during the stopping window -> teardown early-out
     // Controller-error tier: one-shot latches (e.g. HandshakeTimeout) set by the FSM, cleared only
     // by an explicit fault_reset. The bus WkcFault tier is live (recomputed from master_->fault()
     // each cycle) and is not stored here, so a persistent bus fault correctly reappears after a
@@ -422,10 +391,6 @@ class ServoController : public SlaveControl {
     // FSM helpers (RT-only). Defined in the .cpp. ctx is used for output writes and fault reads,
     // since the Runner is the sole Master toucher.
     std::uint16_t step_lifecycle(CycleContext& ctx, Status status, const CommandBatch& batch, std::int32_t actual) noexcept;
-    // Driver-owned runtime mode-switch step (Stopping/Settling); returns the cw the sequencer wrote.
-    std::uint16_t run_mode_switch(CycleContext& ctx, std::int32_t actual, Cia402Mode want) noexcept;
-    // Safe give-up for a switch that couldn't confirm (motor won't stop / echo never arrives). No throw.
-    void mode_switch_give_up(std::int8_t confirmed) noexcept;
     std::uint16_t fault_reset_with_rearm(Status status) noexcept;
     // Reads this cycle's owned input snapshot via ctx (0x603F, statusword, etc. all from the same
     // latched image the Runner copied in).
