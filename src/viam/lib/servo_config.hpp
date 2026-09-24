@@ -17,18 +17,30 @@
 
 namespace ethercat::servo {
 
+// Which CiA402 mode family the driver runs (the "control_mode" attribute). CyclicPosition: CSP, the
+// master streams 0x607A from its own trajectory. Profile: PP for go_to/go_for and PV for set_rpm,
+// switched at runtime; the drive generates the trajectory.
+enum class MotionModeKind : std::uint8_t {
+    CyclicPosition,
+    Profile,
+};
+
+const char* to_string(MotionModeKind mode) noexcept;
+
 struct ServoConfig {
     // --- identity / bus ---
     std::string ifname;          // EtherCAT NIC
     std::uint16_t slave_id = 1;  // 1-based ring position
-    // The RxPDO/TxPDO map is a fixed driver-defined superset (set_fixed_pdo_map()), never
-    // user-supplied. These fields hold that built map (fed to the Master's SDO remap path);
-    // populated by the driver, not parsed from the machine config.
-    ethercat::PdoMap rxpdo;  // command map (0x1C12): cw + 0x6060 + 0x607A + 0x6081 + 0x60FF
+    MotionModeKind motion_mode = MotionModeKind::CyclicPosition;
+    // The PDO maps are driver-defined per motion_mode (set_fixed_pdo_map()), never user-supplied.
+    ethercat::PdoMap rxpdo;  // command map (0x1C12): cw + 0x607A (cyclic) | cw + 0x6060 + 0x607A + 0x6081 + 0x60FF (profile)
     ethercat::PdoMap txpdo;  // feedback map (0x1C13): 0x603F,0x6041,0x6061,0x6064,0x606C,0x6077
 
     // --- motor limits ---
-    double max_motor_speed_rpm = 0.0;       // >= 0; the speed clamp
+    double max_motor_speed_rpm = 0.0;  // >= 0; the speed clamp
+    // Ramp acceleration of the master-side trajectory (CSP), rpm/s; 0 = max_motor_speed_rpm per
+    // second. Ignored in profile mode (the drive's 0x6083/0x6084 apply). >= 0.
+    double max_accel_rpm_per_s = 0.0;
     double motor_rated_current_amps = 0.0;  // > 0 (nameplate datum; scales per-mille current readbacks)
     double gear_ratio = 1.0;                // motor revs per output rev; != 0
     double counts_per_rev = 0.0;            // encoder counts per motor rev; > 0 (e.g. 2^17 = 131072)
@@ -79,15 +91,10 @@ struct ServoConfig {
     // disagree. Only active when quick_stop_decel > 0 (else the stop is an instant disable-voltage
     // coast and the guard is inert).
     std::uint32_t controlled_stop_window_ms = 1000;
-    // Fault-reset recovery window: cycles to hold the reset intent, waiting for the drive to reflect
-    // Fault -> SwitchOnDisabled before giving up on a persistent cause. Must exceed the drive's real
-    // clear-reflect latency; a too-large N only delays the give-up diagnostic, never breaks correctness.
-    std::uint32_t fault_reset_window_cycles = 200;  // 200ms @ 1kHz -- generous default
-    // Consecutive dev!=Fault cycles required to confirm the clear stuck before declaring reset
-    // success (clear-then-refault debounce). A refault within this window counts as reset-ineffective,
-    // not a new fault. Keep it small enough to not delay genuine recovery but large enough to outlast
-    // a flicker. A fault_reset_window_cycles below the drive's clear-reflect latency false-fails; keep
-    // it >= that latency.
+    // Period (cycles) between CiA402 fault-reset edges while the drive stays in Fault. Must exceed the
+    // drive's clear latency so a reset that is working is not re-pulsed.
+    std::uint32_t fault_reset_window_cycles = 200;  // 200 ms @ 1 kHz
+    // Consecutive non-Fault cycles before a clear counts (a clear-then-refault flicker is not recovery).
     std::uint32_t fault_reset_clear_confirm_cycles = 3;
     // The blocking go_to/go_for wait has no timeout: a long move must not be killed by a clock, and a
     // stuck move parks until the client stops it, the drive faults, or the RT loop exits.
