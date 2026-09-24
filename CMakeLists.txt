@@ -320,6 +320,7 @@ endfunction()
 
 viam_add_test(pdo_buffer_test tests/pdo_buffer_test.cpp)
 viam_add_test(log_test tests/log_test.cpp)
+viam_add_test(trapezoid_test tests/trapezoid_test.cpp)
 viam_add_test(cia402_test tests/cia402_test.cpp)
 viam_add_test(pdo_cache_test tests/pdo_cache_test.cpp)
 viam_add_test(soem_backend_test tests/soem_backend_test.cpp)
