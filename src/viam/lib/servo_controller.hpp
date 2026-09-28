@@ -183,6 +183,8 @@ class ServoController : public SlaveControl {
     double rated_current_amps() const noexcept;
     // The motion mode selected at setup ("PP", "CSP"), or "unselected" before the first start().
     const char* motion_mode_name() const noexcept;
+    // The drive reports the configured emergency-stop fault code (lock-free, published state).
+    bool emergency_stopped() const noexcept;
 
    protected:
     // --- Device seams. The base is the generic CiA402 servo driver; a device subclass
@@ -405,6 +407,8 @@ class ServoController : public SlaveControl {
     bool try_claim_motion_slot(std::uint32_t gen) noexcept;
     void release_motion_slot(std::uint32_t gen) noexcept;  // frees the slot if `gen` still owns it
     bool motion_slot_busy() const noexcept;                // a live (non-terminal) blocking move holds the slot
+    // emergency_stopped() without the lock, for callers that already hold api_mutex_.
+    bool estop_engaged() const noexcept;
     // Submit a PV velocity setpoint (rpm to guarded device counts) without the slot check, for
     // set_rpm (after its own check) and go_for(PV) (which owns the slot for its whole timed run).
     void push_velocity(double rpm) noexcept;

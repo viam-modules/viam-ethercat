@@ -150,6 +150,23 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs, ethercat::servo::MotionM
     c.counts_per_rev = req_num(attrs, "counts_per_rev");
     c.motor_rated_current_amps = req_num(attrs, "motor_rated_current_amps");
     c.gear_ratio = opt_num(attrs, "gear_ratio", 1.0);
+    // 0x603F code the drive reports while its emergency-stop input is engaged (e.g. "0xFF3A").
+    if (const ProtoValue* const v = find_attr(attrs, "emergency_stop_fault_code")) {
+        unsigned long code = 0;
+        if (const double* const d = v->get<double>()) {
+            code = static_cast<unsigned long>(*d);
+        } else if (const std::string* const t = v->get<std::string>()) {
+            try {
+                code = std::stoul(*t, nullptr, 0);  // "0xFF3A" or decimal
+            } catch (const std::exception&) {
+                throw Error("config attribute 'emergency_stop_fault_code' is not a number: " + *t);
+            }
+        }
+        if (code > 0xFFFF) {
+            throw Error("config attribute 'emergency_stop_fault_code' must fit in 16 bits");
+        }
+        c.estop_fault_code = static_cast<std::uint16_t>(code);
+    }
 
     c.position_tolerance_counts = static_cast<std::int32_t>(opt_num(attrs, "position_tolerance_counts", 0.0));
 
@@ -391,6 +408,7 @@ ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
         status.emplace("is_disconnected", ProtoValue(controller_->is_disconnected()));
         status.emplace("last_error", ProtoValue(controller_->last_error()));
         status.emplace("motion_mode", ProtoValue(std::string(controller_->motion_mode_name())));  // "PP" or "CSP"
+        status.emplace("emergency_stop", ProtoValue(controller_->emergency_stopped()));
         result.emplace("status", ProtoValue(std::move(status)));
     }
     // Standard-CiA402 SDO reads (no config, no override). On success, the converted value goes under
