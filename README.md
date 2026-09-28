@@ -42,6 +42,7 @@ Add a motor component with one of the models above. Attributes:
 | `sync_cycle_granularity_ns` | no | 0 | drive's SYNC0 cycle granularity; a bad `loop_rate_hz` is then rejected at config time |
 | `require_realtime` | no | true | hard-fail at load without SCHED_FIFO |
 | `rt_priority` | no | 80 | SCHED_FIFO priority (1..99) |
+| `emergency_stop_fault_code` | no | none | 0x603F value the drive reports while its emergency-stop input is engaged (e.g. `"0xFF3A"`); while present, `status` reports `emergency_stop: true`, motion calls fail with "emergency stop engaged", and no automatic fault-reset edges are sent (the `fault_reset` do_command still works, for a drive that latches the stop) |
 | `max_acceleration_rpm_per_s` | no | `max_rpm` per second | ramp acceleration of the master-side trajectory in `csp`; ignored in `profile` |
 
 ### Control mode
