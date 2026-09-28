@@ -406,6 +406,7 @@ std::uint16_t ServoController::enter_resetting(CycleContext& ctx) noexcept {
     lifecycle_ = Resetting{};
     reset_cycles_ = 0;
     clear_streak_ = 0;
+    motion_->reset();  // no command survives a fault: recovery re-enables into a hold, never into the old motion
     // RT-context log (one-shot; the RT rule in log.hpp)
     ETHERCAT_LOG_WARN("servo",
                       "slave {}: drive fault {} -- presenting a fault-reset edge every {} cycles until it clears",
@@ -594,6 +595,7 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         }
         if (batch.disable) {
             lifecycle_ = Disabled{};
+            motion_->reset();  // likewise: enable() re-energizes into a hold
             return ControlWord::disable_voltage();
         }
         if (batch.quick_stop) {
