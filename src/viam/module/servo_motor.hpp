@@ -36,7 +36,7 @@ using namespace viam::sdk;
 // Parse a Viam resource config's attributes (the ProtoStruct from cfg.attributes())
 // into a validated ServoConfig. Throws ethercat::Error (clear text) on any
 // missing/wrong-typed/invalid field. Exposed for offline config-file validation.
-ServoConfig parse_servo_config(const ProtoStruct& attributes);
+ServoConfig parse_servo_config(const ProtoStruct& attributes, ethercat::servo::MotionModeKind default_mode);
 
 class ServoMotor final : public Motor, public Reconfigurable {
    public:
@@ -51,7 +51,7 @@ class ServoMotor final : public Motor, public Reconfigurable {
 
     // Static validator for ModelRegistration: parse+validate the config, throwing
     // a clear Error on any problem. A motor has no dependencies -> returns {}.
-    static std::vector<std::string> validate(const ResourceConfig& cfg);
+    static std::vector<std::string> validate(const ResourceConfig& cfg, ethercat::servo::MotionModeKind default_mode);
 
     // Production constructor: parse cfg -> ServoConfig -> build + start a
     // SoemBackend-backed ServoController.

@@ -269,6 +269,7 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
                 const CycleContext& cctx = static_cast<const CycleContext&>(ctx);
                 any_sync_fault = any_sync_fault || a.control->sync_faulted(cctx);
                 all_present = all_present && a.control->drive_present(cctx);
+                a.control->stage_bringup_outputs(ctx);  // dispatch() copies the staged image to the wire after this hook
             });
         }
         const BringupStatus bs = master_.bringup_step(any_sync_fault, all_present);

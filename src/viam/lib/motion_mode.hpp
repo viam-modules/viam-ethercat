@@ -14,8 +14,14 @@
 #include "ethercat/master.hpp"
 #include "ethercat/runner.hpp"
 #include "viam/lib/servo_config.hpp"
+#include "viam/lib/trapezoid.hpp"
 
 namespace ethercat::servo {
+
+// Cycles to wait for 0x6061 to echo a commanded 0x6060 before treating the drive as not following.
+// Drives adopt a mode within a few cycles; this bound (200 ms at 1 kHz) only turns a drive that never
+// follows into an error instead of an indefinite hold.
+constexpr std::uint32_t kModeEchoCycles = 200;
 
 // One cycle's inputs, read by the controller from the latched image.
 struct MotionFeedback {
@@ -136,6 +142,58 @@ class ProfilePositionMode final : public MotionMode {
     bool pending_new_setpoint_ = false;
     std::uint32_t echo_wait_cycles_ = 0;  // cycles 0x6061 has lagged intent_
     bool mode_not_adopted_ = false;       // one cycle, when the echo wait expires
+};
+
+// Cyclic Synchronous Position: the master streams 0x607A every cycle from a TrapezoidGenerator;
+// go_to/go_for are goals, set_rpm a velocity run, halt a ramp to rest. The drive only closes its
+// position loop. For drives that implement only the cyclic synchronous modes.
+class CyclicPositionMode final : public MotionMode {
+   public:
+    // dt_s: cycle period; max_accel_cps2: ramp acceleration; max_vel_cps: the ceiling the shutdown ramp starts from.
+    CyclicPositionMode(double dt_s, double max_accel_cps2, double max_vel_cps) noexcept
+        : dt_s_(dt_s), accel_(max_accel_cps2), max_vel_cps_(max_vel_cps) {}
+
+    const char* name() const noexcept override {
+        return "CSP";
+    }
+    Cia402Mode commanded_mode() const noexcept override {
+        return Cia402Mode::CyclicSyncPosition;
+    }
+    Cia402Mode mode_required_by(MotionCommand cmd) const noexcept override {
+        (void)cmd;
+        return Cia402Mode::CyclicSyncPosition;  // one mode for both kinds of command
+    }
+    std::uint32_t resolve(ConfigContext& cfg) override;
+    void reset() noexcept override;
+    std::uint32_t shutdown_cycles() const noexcept override;
+
+    void go_to(std::int32_t target_counts, std::uint32_t velocity_cps) noexcept override;
+    void set_velocity(std::int32_t velocity_cps) noexcept override;
+    void halt() noexcept override {
+        generator_.stop(accel_);  // ramp to rest, then hold the position reached
+    }
+
+    std::uint16_t step(CycleContext& ctx, const MotionFeedback& fb) noexcept override;
+    void track(CycleContext& ctx, const MotionFeedback& fb) noexcept override;
+    std::uint16_t step_shutdown(CycleContext& ctx, const MotionFeedback& fb) noexcept override;
+
+    std::int32_t target() const noexcept override {
+        return generator_.goal();
+    }
+    bool is_target_reached(const MotionFeedback& fb) const noexcept override {
+        return positioning_ && generator_.idle() && fb.near_target && fb.at_rest;  // bit 10 is a status toggle in CSP
+    }
+    bool is_moving() const noexcept override {
+        return !generator_.idle();  // the streamed target is changing
+    }
+
+   private:
+    const double dt_s_;
+    const double accel_;
+    const double max_vel_cps_;
+    FieldLocation f_target_pos_{};  // 0x607A (required)
+    TrapezoidGenerator generator_;
+    bool positioning_ = true;  // last command: a positioning move (true) or a velocity run (false)
 };
 
 }  // namespace ethercat::servo

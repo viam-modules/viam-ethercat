@@ -34,6 +34,7 @@ Add a motor component with one of the models above. Attributes:
 | `counts_per_rev` | yes | — | encoder counts per motor revolution |
 | `motor_rated_current_amps` | yes | — | nameplate rated current |
 | `slave` | no | 1 | 1-based position of the drive on the bus |
+| `control_mode` | no | `csp` (`profile` for `a6-servo`) | `csp`: cyclic synchronous position, master-side trajectory, needs `use_distributed_clocks`; `profile`: PP for `go_to`/`go_for`, PV for `set_rpm`, the drive generates the trajectory |
 | `gear_ratio` | no | 1.0 | motor revolutions per output revolution |
 | `position_tolerance_counts` | no | counts_per_rev/720 | "reached/stopped" stability band |
 | `loop_rate_hz` | no | 1000 | cycle rate (1..1000) |
@@ -41,10 +42,22 @@ Add a motor component with one of the models above. Attributes:
 | `sync_cycle_granularity_ns` | no | 0 | drive's SYNC0 cycle granularity; a bad `loop_rate_hz` is then rejected at config time |
 | `require_realtime` | no | true | hard-fail at load without SCHED_FIFO |
 | `rt_priority` | no | 80 | SCHED_FIFO priority (1..99) |
+| `max_acceleration_rpm_per_s` | no | `max_rpm` per second | ramp acceleration of the master-side trajectory in `csp`; ignored in `profile` |
 
-There is no PDO-map or control-mode configuration: the driver defines one fixed
-CiA402 map and switches between profile-position and profile-velocity at
-runtime per API call.
+### Control mode
+
+`control_mode` picks the CiA402 mode family and, with it, the driver-defined PDO map:
+
+- `csp` (default): cyclic synchronous position. The driver runs a trapezoidal trajectory on the
+  master and streams the target position every cycle; `max_acceleration_rpm_per_s` sets the ramp.
+  Requires `use_distributed_clocks: true`.
+- `profile`: profile position for `go_to`/`go_for` and profile velocity for `set_rpm`, switched at
+  runtime; the drive generates the trajectory. Default for the `a6-servo` model.
+
+The mode is selected on the drive by SDO at start. A drive that does not implement it fails to
+start with an error naming the refused mode; the running mode is reported as `motion_mode` in the
+`status` do_command. There is no PDO-map configuration: the driver defines one CiA402 map per
+control mode.
 
 ### Generic CiA402 servo
 
@@ -93,6 +106,9 @@ matter:
 
 - `stop()` is a CiA402 Halt: the motor ramps to standstill and **holds position
   energized**. Use the `disable` do_command to de-energize (coast).
+- A drive fault is recovered the standard CiA402 way: the module presents fault-reset edges
+  (controlword bit 7) every `fault_reset_window_cycles` until the drive leaves Fault, then re-enables.
+  `last_error` names the fault code meanwhile; the `fault_reset` do_command requests an edge at once.
 - On bus loss (cable pull, NIC down) the module stays alive: reads return
   fail-safe values, motion calls return a clear error, and the next motion call
   after the link returns rebuilds the connection automatically.

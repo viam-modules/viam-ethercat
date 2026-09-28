@@ -78,7 +78,6 @@ struct SlaveConfig {
     std::uint16_t slave_id = 1;  // 1-based ring position
     PdoMap rxpdo;                // outputs -> SM2 0x1C12 (assign-index derived)
     PdoMap txpdo;                // inputs  -> SM3 0x1C13 (assign-index derived)
-    Cia402Mode default_mode = Cia402Mode::ProfilePosition;
     std::uint32_t sync_cycle_granularity_ns = 0;
 };
 
