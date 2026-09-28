@@ -20,6 +20,7 @@
 #include <viam/sdk/log/logging.hpp>
 #include <viam/sdk/module/service.hpp>
 
+#include "viam/module/gantry_axis.hpp"
 #include "viam/module/servo_motor.hpp"
 
 using namespace viam::sdk;
@@ -38,7 +39,9 @@ int main(int argc, char** argv) {
             }
         });
 
-        std::make_shared<ModuleService>(argc, argv, ethercat::servo::ServoMotor::create_model_registrations())->serve();
+        auto registrations = ethercat::servo::ServoMotor::create_model_registrations();
+        registrations.push_back(ethercat::servo::GantryAxis::create_model_registration());
+        std::make_shared<ModuleService>(argc, argv, std::move(registrations))->serve();
 
         io_context.stop();
         io_thread.join();

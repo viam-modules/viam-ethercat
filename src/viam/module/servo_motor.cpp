@@ -552,6 +552,15 @@ ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
         controller_->disable();
         result.emplace("disable", ProtoValue(true));
     }
+    // Identity of the driver behind this motor, for a component that needs its contract (the
+    // gantry checks it at config time rather than discovering a missing verb mid-home).
+    if (command_flag(command, "describe")) {
+        ProtoStruct d;
+        d.emplace("driver", ProtoValue(std::string("viam:ethercat")));
+        d.emplace("contract", ProtoValue(1.0));
+        d.emplace("homing", ProtoValue(true));
+        result.emplace("describe", ProtoValue(std::move(d)));
+    }
     if (command_flag(command, "status")) {
         result.emplace("status", ProtoValue(get_status()));
     }
@@ -687,7 +696,7 @@ ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
     }
     if (result.empty()) {
         throw std::runtime_error(
-            "unknown do_command; supported keys (each a bool): fault_reset, enable, disable, status; "
+            "unknown do_command; supported keys (each a bool): describe, fault_reset, enable, disable, status; "
             "home {direction, speed_rpm, ...}; "
             "get_motor_voltage, get_motor_current_actual_value, get_motor_drive_modes (converted SDO reads); "
             "sdo_read / sdo_write {index, sub, type, value} (manufacturer-specific objects 0x2000-0x5FFF)");

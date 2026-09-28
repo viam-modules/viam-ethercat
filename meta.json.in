@@ -14,6 +14,11 @@
       "api": "rdk:component:motor",
       "model": "viam:ethercat:a6-servo",
       "markdown_link": "README.md#configuration-and-usage"
+    },
+    {
+      "api": "rdk:component:gantry",
+      "model": "viam:ethercat:gantry",
+      "markdown_link": "README.md#single-axis-gantry"
     }
   ],
   "entrypoint": "@CMAKE_INSTALL_BINDIR@/ethercat-servo"

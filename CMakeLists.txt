@@ -250,6 +250,7 @@ if (ETHERCAT_BUILD_MODULE)
   target_sources(ethercat-servo
     PRIVATE
       src/viam/module/main.cpp
+      src/viam/module/gantry_axis.cpp
       src/viam/module/servo_motor.cpp
   )
 
