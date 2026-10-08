@@ -117,6 +117,11 @@ matter:
   (`"log_configuration": {"level": "debug"}` on the motor). `debug` traces every SDO (object,
   payload, decoded abort) and AL state request during bring-up; `info` prints one line per
   bring-up phase and one per fault-code change.
+- Raw SDO access to manufacturer-specific objects (0x2000-0x5FFF) and 0x1010 (store parameters) for commissioning:
+  `{"sdo_read": {"index": "0x2A9C", "sub": 4, "type": "u16"}}`,
+  `{"sdo_write": {"index": "0x2A9C", "sub": 4, "type": "u16", "value": 2}}`. Types `u8 i8 u16 i16 u32 i32
+  string bytes`; values are numbers or `"0x.."` / hex-byte strings. A drive refusal returns
+  `{"ok": false, "abort_code": "0x06090030", "error": "..."}`; writes are refused while the motor moves.
 - `do_command` verbs: `status`, `fault_reset`, `enable`, `disable`,
   `get_motor_voltage`, `get_motor_current_actual_value`,
   `get_motor_drive_modes`.

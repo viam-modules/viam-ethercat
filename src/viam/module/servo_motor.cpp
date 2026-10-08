@@ -23,6 +23,7 @@
 #include "ethercat/log.hpp"
 #include "ethercat/pdo_mapping.hpp"
 #include "viam/lib/a6_servo_driver.hpp"
+#include "viam/lib/sdo_codec.hpp"
 #include "viam/lib/servo_config.hpp"
 
 namespace ethercat::servo {
@@ -197,6 +198,78 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs, ethercat::servo::MotionM
 template <class Controller>
 std::unique_ptr<ServoController> build_controller(const ResourceConfig& cfg) {
     return std::make_unique<Controller>(config_from_attrs(cfg.attributes(), Controller::kDefaultMotionMode));
+}
+
+// --- raw SDO verbs: manufacturer-specific objects (0x2000-0x5FFF) plus 0x1010 (store parameters);
+// the driver owns the other standard objects.
+namespace codec = ethercat::servo::sdo_codec;
+
+struct SdoRequest {
+    std::uint16_t index = 0;
+    std::uint8_t sub = 0;
+    const codec::TypeInfo* type = nullptr;
+    codec::Input value;
+};
+
+codec::Input input_of(const ProtoValue& v, const char* key) {
+    if (const double* d = v.get<double>()) {
+        return codec::Input{*d, std::nullopt};
+    }
+    if (const std::string* t = v.get<std::string>()) {
+        return codec::Input{std::nullopt, *t};
+    }
+    throw Error(std::string("'") + key + "' must be a number or a string");
+}
+
+std::uint32_t small_uint(const ProtoValue& v, const char* key, const char* type) {
+    const codec::TypeInfo& t = *codec::find_type(type);
+    return static_cast<std::uint32_t>(*t.decode(t.encode(input_of(v, key))).number);
+}
+
+SdoRequest parse_sdo_request(const ProtoValue& v, const char* verb, bool with_value) {
+    const ProtoStruct* const req = v.get<ProtoStruct>();
+    const ProtoValue* const index = req ? find_attr(*req, "index") : nullptr;
+    const auto type_name = req ? opt_attr<std::string>(*req, "type") : std::nullopt;
+    const codec::TypeInfo* const type = type_name ? codec::find_type(*type_name) : nullptr;
+    if (index == nullptr || type == nullptr) {
+        throw Error(std::string(verb) + " expects {index, sub?, type: u8|i8|u16|i16|u32|i32|string|bytes" +
+                    (with_value ? ", value}" : "}"));
+    }
+    SdoRequest r;
+    r.index = static_cast<std::uint16_t>(small_uint(*index, "index", "u16"));
+    if (const ProtoValue* const sub = find_attr(*req, "sub")) {
+        r.sub = static_cast<std::uint8_t>(small_uint(*sub, "sub", "u8"));
+    }
+    r.type = type;
+    if ((r.index < 0x2000 || r.index > 0x5FFF) && r.index != 0x1010) {
+        throw Error(std::string(verb) + ": only manufacturer-specific objects (0x2000-0x5FFF) and 0x1010 are accessible");
+    }
+    if (with_value) {
+        const ProtoValue* const val = find_attr(*req, "value");
+        if (val == nullptr) {
+            throw Error("sdo_write: 'value' is required");
+        }
+        r.value = input_of(*val, "value");
+    }
+    return r;
+}
+
+ProtoStruct sdo_reply(const codec::Decoded& d, const std::vector<std::byte>& raw) {
+    ProtoStruct out;
+    out.emplace("value", d.number ? ProtoValue(*d.number) : ProtoValue(d.text));
+    out.emplace("raw", ProtoValue(ethercat::log::hex_bytes(raw)));
+    out.emplace("ok", ProtoValue(true));
+    return out;
+}
+
+ProtoStruct sdo_refusal(const ethercat::SdoError& e) {
+    char code[16];
+    (void)std::snprintf(code, sizeof code, "0x%08X", e.abort_code());
+    ProtoStruct out;
+    out.emplace("ok", ProtoValue(false));
+    out.emplace("abort_code", ProtoValue(std::string(code)));
+    out.emplace("error", ProtoValue(std::string(e.what())));
+    return out;
 }
 
 bool command_flag(const ProtoStruct& command, const char* key) {
@@ -442,10 +515,37 @@ ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
             result.emplace("drive_modes_diag", ProtoValue(std::string("0x6502 unavailable (reporting none): ") + e.what()));
         }
     }
+    // Raw typed SDO access. A drive refusal is data ({ok:false, abort_code, error}); a bad request or
+    // a dead mailbox is a gRPC error.
+    if (const ProtoValue* const rq = find_attr(command, "sdo_read")) {
+        const SdoRequest r = parse_sdo_request(*rq, "sdo_read", false);
+        try {
+            std::vector<std::byte> buf(r.type->width > 0 ? r.type->width : 64);
+            buf.resize(std::min(controller_->sdo_read(r.index, r.sub, buf), buf.size()));
+            result.emplace("sdo_read", ProtoValue(sdo_reply(r.type->decode(buf), buf)));
+        } catch (const ethercat::SdoError& e) {
+            result.emplace("sdo_read", ProtoValue(sdo_refusal(e)));
+        }
+    }
+    if (const ProtoValue* const rq = find_attr(command, "sdo_write")) {
+        const SdoRequest r = parse_sdo_request(*rq, "sdo_write", true);
+        if (controller_->is_moving()) {
+            throw std::runtime_error("sdo_write: the motor is moving; stop it first");
+        }
+        const auto bytes = r.type->encode(r.value);
+        ETHERCAT_LOG_INFO("servo", "raw SDO write 0x{:04X}:{} <- [{}]", r.index, r.sub, ethercat::log::hex_bytes(bytes));
+        try {
+            controller_->sdo_write(r.index, r.sub, bytes);
+            result.emplace("sdo_write", ProtoValue(sdo_reply(r.type->decode(bytes), bytes)));
+        } catch (const ethercat::SdoError& e) {
+            result.emplace("sdo_write", ProtoValue(sdo_refusal(e)));
+        }
+    }
     if (result.empty()) {
         throw std::runtime_error(
             "unknown do_command; supported keys (each a bool): fault_reset, enable, disable, status; "
-            "get_motor_voltage, get_motor_current_actual_value, get_motor_drive_modes (converted SDO reads)");
+            "get_motor_voltage, get_motor_current_actual_value, get_motor_drive_modes (converted SDO reads); "
+            "sdo_read / sdo_write {index, sub, type, value} (manufacturer-specific objects 0x2000-0x5FFF)");
     }
     return result;
 }
