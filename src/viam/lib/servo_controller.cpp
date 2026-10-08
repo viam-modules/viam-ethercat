@@ -407,11 +407,18 @@ std::uint16_t ServoController::enter_resetting(CycleContext& ctx) noexcept {
     reset_cycles_ = 0;
     clear_streak_ = 0;
     motion_->reset();  // no command survives a fault: recovery re-enables into a hold, never into the old motion
+    const std::uint16_t fc = f_fault_code_ ? ctx.load<std::uint16_t>(*f_fault_code_) : std::uint16_t{0};
+    if (config_.estop_fault_code != 0 && fc == config_.estop_fault_code) {
+        // RT-context log (one-shot; the RT rule in log.hpp)
+        ETHERCAT_LOG_WARN(
+            "servo", "slave {}: emergency stop engaged ({}) -- no fault-reset edges until it is released", config_.slave_id, hex(fc));
+        return ControlWord::disable_voltage();
+    }
     // RT-context log (one-shot; the RT rule in log.hpp)
     ETHERCAT_LOG_WARN("servo",
                       "slave {}: drive fault {} -- presenting a fault-reset edge every {} cycles until it clears",
                       config_.slave_id,
-                      hex(f_fault_code_ ? ctx.load<std::uint16_t>(*f_fault_code_) : std::uint16_t{0}),
+                      hex(fc),
                       config_.fault_reset_window_cycles);
     return ControlWord::fault_reset();  // bit 7 rising edge (the previous controlword had it low)
 }
@@ -476,6 +483,16 @@ MotionFeedback ServoController::feedback(CycleContext& ctx, Status status, std::
         std::abs(static_cast<std::int64_t>(actual) - motion_->target()) <= static_cast<std::int64_t>(config_.position_tolerance_counts);
     fb.target_reached_bit_usable = target_reached_bit_usable();
     return fb;
+}
+
+bool ServoController::estop_engaged() const noexcept {
+    return config_.estop_fault_code != 0 && state_.drive_faulted.load(std::memory_order_acquire) &&
+           state_.drive_fault_code.load(std::memory_order_relaxed) == config_.estop_fault_code;
+}
+
+bool ServoController::emergency_stopped() const noexcept {
+    const std::shared_lock<std::shared_mutex> lk(api_mutex_);
+    return estop_engaged();
 }
 
 const char* ServoController::motion_mode_name() const noexcept {
@@ -632,7 +649,11 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
             reset_cycles_ = 0;
             return ControlWord::fault_reset();
         }
-        const bool edge = dev == Cia402State::Fault && (reset_cycles_ % config_.fault_reset_window_cycles) == 0;
+        // No reset edges while the configured emergency-stop code is present: the stop is engaged, and
+        // clearing it is the operator's act (release, then fault_reset when the drive latches it).
+        const std::uint16_t fc = f_fault_code_ ? ctx.load<std::uint16_t>(*f_fault_code_) : std::uint16_t{0};
+        const bool estop = config_.estop_fault_code != 0 && fc == config_.estop_fault_code;
+        const bool edge = dev == Cia402State::Fault && !estop && (reset_cycles_ % config_.fault_reset_window_cycles) == 0;
         return edge ? ControlWord::fault_reset() : ControlWord::disable_voltage();
     }
     // Disabled
@@ -957,6 +978,9 @@ void ServoController::set_rpm(double rpm) {
     if (degraded_.load(std::memory_order_acquire)) {  // §8 Degraded-but-alive: motion APIs throw, never act
         throw Error("set_rpm unavailable: " + (degraded_reason_.empty() ? last_error() : degraded_reason_));
     }
+    if (estop_engaged()) {
+        throw Error("set_rpm: emergency stop engaged -- release it before commanding motion");
+    }
     // Always switch-capable: set_rpm ensures PV at runtime, never rejected on mode. A PV setpoint
     // yields to a live blocking move (a go_for timed run) and is rejected "operation ongoing"
     // (including set_rpm(0); halt() is the stop verb). PV setpoints are latest-wins among themselves
@@ -1067,6 +1091,9 @@ void ServoController::go_to(double rpm, double position) {
         if (degraded_.load(std::memory_order_acquire)) {  // §8
             throw Error("go_to unavailable: " + (degraded_reason_.empty() ? last_error() : degraded_reason_));
         }
+        if (estop_engaged()) {
+            throw Error("go_to: emergency stop engaged -- release it before commanding motion");
+        }
         // Always switch-capable: go_to ensures PP at runtime, never rejected on mode. Absolute target
         // in the zeroed frame: add zero_offset_counts to map the user's zeroed position to the raw
         // encoder frame, so go_to(X) lands where position_revs() == X (get_position is zeroed too).
@@ -1099,6 +1126,9 @@ void ServoController::go_for(double rpm, double revs) {
         const std::shared_lock<std::shared_mutex> lk(api_mutex_);
         if (degraded_.load(std::memory_order_acquire)) {  // §8
             throw Error("go_for unavailable: " + (degraded_reason_.empty() ? last_error() : degraded_reason_));
+        }
+        if (estop_engaged()) {
+            throw Error("go_for: emergency stop engaged -- release it before commanding motion");
         }
         // Relative move (frame-agnostic): push SetTarget{relative=true} so the FSM computes target =
         // actual + delta. Do not route through go_to, which adds zero_offset (absolute frame) and
@@ -1142,6 +1172,8 @@ void ServoController::halt() noexcept {
 
 void ServoController::request_fault_reset() noexcept {
     const std::shared_lock<std::shared_mutex> lk(api_mutex_);
+    // Always accepted, including while the stop is engaged: a drive that latches the stop keeps
+    // reporting its code after release, and this edge is what clears it.
     (void)commands_.push(Command{FaultReset{}});
 }
 
@@ -1244,7 +1276,9 @@ std::string ServoController::last_error() const {
     // Drive (root cause), pair read: flag acquire, then code relaxed.
     if (state_.drive_faulted.load(std::memory_order_acquire)) {
         const std::uint16_t code = state_.drive_fault_code.load(std::memory_order_relaxed);
-        if (code != 0) {
+        if (code != 0 && code == config_.estop_fault_code) {
+            append("emergency stop engaged (0x603F " + hex(code) + ")");
+        } else if (code != 0) {
             const std::string gloss = fault_description(code);
             append("drive fault " + hex(code) + (gloss.empty() ? "" : " (" + gloss + ")"));
         } else {

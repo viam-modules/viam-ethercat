@@ -83,6 +83,10 @@ struct ServoConfig {
     // skipped and the drive falls back to disable-voltage on stop. >0 = configured and asserted at
     // bring-up. Standard CiA402 tunable; from config, never a hardcoded device value.
     std::uint32_t quick_stop_decel = 0;
+    // 0x603F value the drive reports while its emergency-stop input is engaged (drive-specific, so it
+    // comes from config). 0 = not configured. While it is present the motion API refuses with
+    // "emergency stop engaged" and no fault-reset edges are presented.
+    std::uint16_t estop_fault_code = 0;
     // Controlled-stop window (ms): the single source of truth for the lifecycle-stop. It sizes the
     // RT teardown window (teardown_cycles = window x loop_rate) so a quick-stop ramp completes before
     // close()->INIT de-energizes (no torque-cut at speed), and the velocity guard is derived from it:
