@@ -8,6 +8,8 @@
 
 #include "ethercat/errors.hpp"
 #include "ethercat/field.hpp"
+#include "ethercat/log.hpp"
+#include "ethercat/pdo_buffer.hpp"
 
 namespace ethercat::servo {
 
@@ -144,7 +146,20 @@ MotionFault ProfilePositionMode::fault() const noexcept {
 std::uint32_t CyclicPositionMode::resolve(ConfigContext& cfg) {
     select_mode_on_drive(cfg, Cia402Mode::CyclicSyncPosition, "csp");
     f_target_pos_ = cfg.resolve_rx<cia402::TargetPosition>();  // the one command object CSP streams
-    return 0;                                                  // no drive-side quick-stop: the generator owns the stop
+    if (quick_stop_decel_ > 0) {
+        // The generator owns the module's stop, but the drive's own quick stop and E-stop input ramp
+        // with 0x6085, so the configured value is offered here too. Best-effort: the module does not
+        // depend on it in this mode, and a drive that refuses the value must still come up.
+        std::array<std::byte, 4> v{};
+        store_le<std::uint32_t>(v, quick_stop_decel_);
+        try {
+            cfg.sdo_write(0x6085, 0, v);
+        } catch (const SdoError& e) {
+            ETHERCAT_LOG_WARN(
+                "servo", "0x6085 <- {} refused; the drive keeps its own quick-stop deceleration ({})", quick_stop_decel_, e.what());
+        }
+    }
+    return 0;  // no drive-side stop budget: the generator's ramp bounds the module's stop
 }
 
 void CyclicPositionMode::reset() noexcept {
