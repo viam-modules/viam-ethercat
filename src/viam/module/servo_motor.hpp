@@ -4,14 +4,15 @@
 //
 // This is thin SDK glue: every Motor method forwards to the ServoController, mapping the generic
 // motor API onto CiA402 Profile-Position / Profile-Velocity. ServoMotor adds no locking of its
-// own; all API-vs-reconfigure serialization lives in the controller's api_mutex_.
+// own; all API serialization lives in the controller's api_mutex_. A config change destroys this
+// resource and builds a new one (the SDK has no reconfigure hook), so the controller's own
+// stop-join-rebuild path runs through the destructor and the next constructor.
 //
 // Concurrency-coverage invariant (load-bearing): ServoMotor must stay a thin pass-through --
-// `controller_` is never reassigned (reconfigure() forwards in-place to
-// controller_->reconfigure()) and the wrapper holds no lock or state of its own. So the module
-// layer's entire concurrency surface is the controller's api_mutex_. If a future change reassigns
-// controller_ or adds a wrapper lock, this invariant breaks and module-level concurrency testing
-// becomes required.
+// `controller_` is never reassigned and the wrapper holds no lock or state of its own. So the
+// module layer's entire concurrency surface is the controller's api_mutex_. If a future change
+// reassigns controller_ or adds a wrapper lock, this invariant breaks and module-level
+// concurrency testing becomes required.
 //
 // A6 specifics never appear here: the PDO map, counts/rev, gear ratio, etc. are
 // parsed from the Viam resource config into a ServoConfig (config data, not code).
@@ -24,7 +25,6 @@
 #include <viam/sdk/config/resource.hpp>
 #include <viam/sdk/log/logging.hpp>
 #include <viam/sdk/registry/registry.hpp>
-#include <viam/sdk/resource/reconfigurable.hpp>
 
 #include "ethercat/log.hpp"
 #include "viam/lib/servo_controller.hpp"
@@ -38,7 +38,7 @@ using namespace viam::sdk;
 // missing/wrong-typed/invalid field. Exposed for offline config-file validation.
 ServoConfig parse_servo_config(const ProtoStruct& attributes, ethercat::servo::MotionModeKind default_mode);
 
-class ServoMotor final : public Motor, public Reconfigurable {
+class ServoMotor final : public Motor {
    public:
     // Two models in the viam:ethercat family: the generic standard-CiA402 driver
     // (viam:ethercat:servo) and the A6 specialization (viam:ethercat:a6-servo), whose factory
@@ -68,8 +68,6 @@ class ServoMotor final : public Motor, public Reconfigurable {
     ServoMotor(ServoMotor&&) = delete;
     ServoMotor& operator=(ServoMotor&&) = delete;
 
-    void reconfigure(const Dependencies& deps, const ResourceConfig& cfg) override;
-
     // --- rdk:component:motor ---
     void set_power(double power_pct, const ProtoStruct& extra) override;
     void set_rpm(double rpm, const ProtoStruct& extra) override;
@@ -80,6 +78,7 @@ class ServoMotor final : public Motor, public Reconfigurable {
     properties get_properties(const ProtoStruct& extra) override;
     power_status get_power_status(const ProtoStruct& extra) override;
     bool is_moving() override;
+    ProtoStruct get_status() override;
     void stop(const ProtoStruct& extra) override;
     ProtoStruct do_command(const ProtoStruct& command) override;
     std::vector<GeometryConfig> get_geometries(const ProtoStruct& extra) override;

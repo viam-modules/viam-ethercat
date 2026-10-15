@@ -21,7 +21,7 @@ fi
 
 # NOTE: If you change this version, also change it in the `conanfile.py`
 # requirements, the Dockerfile, and the top-level CMakeLists.txt.
-git checkout releases/v0.31.0
+git checkout releases/v0.42.0
 
 # Export the recipe to the cache so we can skip rebuilds gracefully
 conan export .

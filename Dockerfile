@@ -80,7 +80,7 @@ RUN mkdir -p /root/opt/src
 RUN cd /root/opt/src && \
     git clone https://github.com/viamrobotics/viam-cpp-sdk && \
     cd viam-cpp-sdk && \
-    git checkout releases/v0.31.0 && \
+    git checkout releases/v0.42.0 && \
     cmake -S . -B build \
         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
         -DVIAMCPPSDK_USE_DYNAMIC_PROTOS=ON \

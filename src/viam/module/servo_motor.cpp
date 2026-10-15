@@ -201,7 +201,7 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs, ethercat::servo::MotionM
 // Build the controller for a model. `Controller` is the generic ServoController (viam:ethercat:servo)
 // or the A6ServoDriver subclass (viam:ethercat:a6-servo); both share the same config parser and ctors
 // (A6 inherits them) and differ only in the three device seams. Returns a base-typed unique_ptr so
-// ServoMotor stays subclass-agnostic (reconfigure() rebuilds the master in place, preserving the type).
+// ServoMotor stays subclass-agnostic.
 template <class Controller>
 std::unique_ptr<ServoController> build_controller(const ResourceConfig& cfg) {
     return std::make_unique<Controller>(config_from_attrs(cfg.attributes(), Controller::kDefaultMotionMode));
@@ -421,12 +421,17 @@ void ServoMotor::install_logging(viam::sdk::log_level level) {
     ethercat::log::set_sink(log_sink_);
 }
 
-void ServoMotor::reconfigure(const Dependencies& /*deps*/, const ResourceConfig& cfg) {
-    // Validate before mutate: parse and validate the new config (throws) before any teardown. The
-    // controller owns the stop->join->rebuild->restart lifecycle.
-    ServoConfig sc = parse_servo_config(cfg.attributes(), controller_->default_motion_mode());
-    install_logging(cfg.get_log_level());
-    controller_->reconfigure(std::move(sc));
+// The drive's state in one struct, for the API's get_status and the `status` do_command alike.
+ProtoStruct ServoMotor::get_status() {
+    ProtoStruct status;
+    status.emplace("is_powered", ProtoValue(controller_->is_powered()));
+    status.emplace("is_moving", ProtoValue(controller_->is_moving()));
+    status.emplace("position", ProtoValue(controller_->position_revs()));
+    status.emplace("is_disconnected", ProtoValue(controller_->is_disconnected()));
+    status.emplace("last_error", ProtoValue(controller_->last_error()));
+    status.emplace("motion_mode", ProtoValue(std::string(controller_->motion_mode_name())));  // "PP" or "CSP"
+    status.emplace("emergency_stop", ProtoValue(controller_->emergency_stopped()));
+    return status;
 }
 
 void ServoMotor::set_power(double /*power_pct*/, const ProtoStruct& /*extra*/) {
@@ -491,15 +496,7 @@ ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
         result.emplace("disable", ProtoValue(true));
     }
     if (command_flag(command, "status")) {
-        ProtoStruct status;
-        status.emplace("is_powered", ProtoValue(controller_->is_powered()));
-        status.emplace("is_moving", ProtoValue(controller_->is_moving()));
-        status.emplace("position", ProtoValue(controller_->position_revs()));
-        status.emplace("is_disconnected", ProtoValue(controller_->is_disconnected()));
-        status.emplace("last_error", ProtoValue(controller_->last_error()));
-        status.emplace("motion_mode", ProtoValue(std::string(controller_->motion_mode_name())));  // "PP" or "CSP"
-        status.emplace("emergency_stop", ProtoValue(controller_->emergency_stopped()));
-        result.emplace("status", ProtoValue(std::move(status)));
+        result.emplace("status", ProtoValue(get_status()));
     }
     // Standard-CiA402 SDO reads (no config, no override). On success, the converted value goes under
     // the clear key. On SDO abort/failure (e.g. the A6 does not implement 0x6079/0x6078), the value is

@@ -34,7 +34,7 @@ class ethercat(ConanFile):
     def requirements(self):
         # NOTE: If you update the `viam-cpp-sdk` dependency here, it should
         # also be updated in `bin/setup.sh` and the Dockerfile.
-        self.requires("viam-cpp-sdk/[>=0.31.0]")
+        self.requires("viam-cpp-sdk/[>=0.42.0]")
         self.requires("boost/[>=1.74.0]")
         # SOEM is NOT a Conan dependency: it is pinned by exact commit SHA and
         # fetched at configure time (see cmake/soem.cmake), so the recipe needs
