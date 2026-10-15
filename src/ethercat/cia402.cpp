@@ -34,6 +34,8 @@ const char* to_string(Cia402Mode mode) noexcept {
             return "ProfileVelocity";
         case Cia402Mode::CyclicSyncPosition:
             return "CyclicSyncPosition";
+        case Cia402Mode::Homing:
+            return "Homing";
     }
     return "Unknown";
 }

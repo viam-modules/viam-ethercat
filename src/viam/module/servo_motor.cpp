@@ -63,6 +63,40 @@ double opt_num(const ProtoStruct& attrs, const std::string& key, double dflt) {
     return opt_attr<double>(attrs, key).value_or(dflt);
 }
 
+namespace codec = ethercat::servo::sdo_codec;
+
+struct SdoRequest {
+    std::uint16_t index = 0;
+    std::uint8_t sub = 0;
+    const codec::TypeInfo* type = nullptr;
+    codec::Input value;
+};
+
+codec::Input input_of(const ProtoValue& v, const char* key) {
+    if (const double* d = v.get<double>()) {
+        return codec::Input{*d, std::nullopt};
+    }
+    if (const std::string* t = v.get<std::string>()) {
+        return codec::Input{std::nullopt, *t};
+    }
+    throw Error(std::string("'") + key + "' must be a number or a string");
+}
+
+std::uint32_t small_uint(const ProtoValue& v, const char* key, const char* type) {
+    const codec::TypeInfo& t = *codec::find_type(type);
+    return static_cast<std::uint32_t>(*t.decode(t.encode(input_of(v, key))).number);
+}
+
+// Upload buffer for a raw read. Every CoE scalar fits in 8 bytes; the rest is headroom for the
+// string objects a drive exposes (name, version), which are the only variable-width ones here.
+constexpr std::size_t kSdoReadBytes = 64;
+
+std::string hex4(std::uint16_t v) {
+    char out[8];
+    (void)std::snprintf(out, sizeof out, "0x%04X", v);
+    return out;
+}
+
 std::string req_str(const ProtoStruct& attrs, const std::string& key) {
     const auto v = opt_attr<std::string>(attrs, key);
     if (!v) {
@@ -152,6 +186,56 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs, ethercat::servo::MotionM
     c.counts_per_rev = req_num(attrs, "counts_per_rev");
     c.motor_rated_current_amps = req_num(attrs, "motor_rated_current_amps");
     c.gear_ratio = opt_num(attrs, "gear_ratio", 1.0);
+    // Absolute-encoder declaration: which object says the encoder retains position, and which 0x603F
+    // codes mean the retained position is gone. All drive-specific, so all from config.
+    if (const ProtoValue* const v = find_attr(attrs, "absolute_encoder")) {
+        const ProtoStruct* const o = v->get<ProtoStruct>();
+        const ProtoValue* const index = o ? find_attr(*o, "index") : nullptr;
+        const ProtoValue* const equals = o ? find_attr(*o, "equals") : nullptr;
+        if (index == nullptr || equals == nullptr) {
+            throw Error("config attribute 'absolute_encoder' expects {index, sub?, type?, equals, invalid_codes?}");
+        }
+        ServoConfig::AbsoluteEncoder& enc = c.absolute_encoder;
+        enc.index = static_cast<std::uint16_t>(small_uint(*index, "index", "u16"));
+        if (const ProtoValue* const sub = find_attr(*o, "sub")) {
+            enc.sub = static_cast<std::uint8_t>(small_uint(*sub, "sub", "u8"));
+        }
+        enc.type = opt_attr<std::string>(*o, "type").value_or("u16");
+        if (codec::find_type(enc.type) == nullptr) {
+            throw Error("config attribute 'absolute_encoder.type' is not a known SDO type: " + enc.type);
+        }
+        const double* const eq = equals->get<double>();
+        if (eq == nullptr) {
+            throw Error("config attribute 'absolute_encoder.equals' must be a number");
+        }
+        enc.equals = *eq;
+        if (const ProtoValue* const codes = find_attr(*o, "invalid_codes")) {
+            const std::vector<ProtoValue>* const list = codes->get<std::vector<ProtoValue>>();
+            if (list == nullptr) {
+                throw Error("config attribute 'absolute_encoder.invalid_codes' must be a list");
+            }
+            for (const ProtoValue& code : *list) {
+                enc.invalid_codes.push_back(static_cast<std::uint16_t>(small_uint(code, "invalid_codes", "u16")));
+            }
+        }
+    }
+    // Object that bounds current during hard-stop homing; drive-specific, so it is named in config.
+    if (const ProtoValue* const v = find_attr(attrs, "homing_torque_object")) {
+        const ProtoStruct* const o = v->get<ProtoStruct>();
+        const ProtoValue* const index = o ? find_attr(*o, "index") : nullptr;
+        if (index == nullptr) {
+            throw Error("config attribute 'homing_torque_object' expects {index, sub?, type?, units_per_percent?}");
+        }
+        c.homing_torque.index = static_cast<std::uint16_t>(small_uint(*index, "index", "u16"));
+        if (const ProtoValue* const sub = find_attr(*o, "sub")) {
+            c.homing_torque.sub = static_cast<std::uint8_t>(small_uint(*sub, "sub", "u8"));
+        }
+        c.homing_torque.type = opt_attr<std::string>(*o, "type").value_or("u16");
+        if (ethercat::servo::sdo_codec::find_type(c.homing_torque.type) == nullptr) {
+            throw Error("config attribute 'homing_torque_object.type' is not a known SDO type: " + c.homing_torque.type);
+        }
+        c.homing_torque.units_per_percent = opt_num(*o, "units_per_percent", 10.0);
+    }
     // 0x603F code the drive reports while its emergency-stop input is engaged (e.g. "0xFF3A").
     if (const ProtoValue* const v = find_attr(attrs, "emergency_stop_fault_code")) {
         unsigned long code = 0;
@@ -209,40 +293,6 @@ std::unique_ptr<ServoController> build_controller(const ResourceConfig& cfg) {
 
 // --- raw SDO verbs: manufacturer-specific objects (0x2000-0x5FFF) plus 0x1010 (store parameters);
 // the driver owns the other standard objects.
-namespace codec = ethercat::servo::sdo_codec;
-
-struct SdoRequest {
-    std::uint16_t index = 0;
-    std::uint8_t sub = 0;
-    const codec::TypeInfo* type = nullptr;
-    codec::Input value;
-};
-
-// Upload buffer for a raw read. Every CoE scalar fits in 8 bytes; the rest is headroom for the
-// string objects a drive exposes (name, version), which are the only variable-width ones here.
-constexpr std::size_t kSdoReadBytes = 64;
-
-std::string hex4(std::uint16_t v) {
-    char out[8];
-    (void)std::snprintf(out, sizeof out, "0x%04X", v);
-    return out;
-}
-
-codec::Input input_of(const ProtoValue& v, const char* key) {
-    if (const double* d = v.get<double>()) {
-        return codec::Input{*d, std::nullopt};
-    }
-    if (const std::string* t = v.get<std::string>()) {
-        return codec::Input{std::nullopt, *t};
-    }
-    throw Error(std::string("'") + key + "' must be a number or a string");
-}
-
-std::uint32_t small_uint(const ProtoValue& v, const char* key, const char* type) {
-    const codec::TypeInfo& t = *codec::find_type(type);
-    return static_cast<std::uint32_t>(*t.decode(t.encode(input_of(v, key))).number);
-}
-
 SdoRequest parse_sdo_request(const ProtoValue& v, const char* verb, bool with_value) {
     const ProtoStruct* const req = v.get<ProtoStruct>();
     const ProtoValue* const index = req ? find_attr(*req, "index") : nullptr;
@@ -431,6 +481,13 @@ ProtoStruct ServoMotor::get_status() {
     status.emplace("last_error", ProtoValue(controller_->last_error()));
     status.emplace("motion_mode", ProtoValue(std::string(controller_->motion_mode_name())));  // "PP" or "CSP"
     status.emplace("emergency_stop", ProtoValue(controller_->emergency_stopped()));
+    status.emplace("warning", ProtoValue(controller_->drive_warning()));  // statusword bit 7
+    status.emplace("fault_code", ProtoValue(hex4(controller_->drive_fault_code())));
+    status.emplace("homed", ProtoValue(controller_->homed()));
+    status.emplace("homing", ProtoValue(std::string(to_string(controller_->homing_state()))));
+    if (const std::string err = controller_->homing_error(); !err.empty()) {
+        status.emplace("homing_error", ProtoValue(err));
+    }
     return status;
 }
 
@@ -531,6 +588,72 @@ ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
     }
     // Raw typed SDO access. A drive refusal is data ({ok:false, abort_code, error}); a bad request or
     // a dead mailbox is a gRPC error.
+    // Is the drive's absolute encoder configured to retain position, and has it kept it? Reads the
+    // declared mode object and the live 0x603F. Reported as data (never an exception) so a caller
+    // can branch on it: `valid` false with a reason means home the axis.
+    if (command_flag(command, "is_abs_enc_valid")) {
+        const ServoConfig::AbsoluteEncoder& enc = controller_->absolute_encoder();
+        ProtoStruct reply;
+        if (enc.index == 0) {
+            reply.emplace("valid", ProtoValue(false));
+            reply.emplace("configured", ProtoValue(false));
+            reply.emplace("reason", ProtoValue(std::string("no 'absolute_encoder' config attribute on this motor")));
+        } else {
+            const codec::TypeInfo& type = *codec::find_type(enc.type);
+            bool configured = false;
+            std::string reason;
+            try {
+                std::vector<std::byte> buf(kSdoReadBytes);
+                buf.resize(std::min(controller_->sdo_read(enc.index, enc.sub, buf), buf.size()));
+                const std::optional<double> mode = type.decode(buf).number;
+                configured = mode.has_value() && *mode == enc.equals;
+                reply.emplace("mode", ProtoValue(mode.value_or(0.0)));
+                if (!configured) {
+                    reason = "the encoder mode object does not read the configured value";
+                }
+            } catch (const std::exception& e) {
+                reason = std::string("reading the encoder mode object failed: ") + e.what();
+            }
+            const std::uint16_t code = controller_->drive_fault_code();
+            const bool lost = std::find(enc.invalid_codes.begin(), enc.invalid_codes.end(), code) != enc.invalid_codes.end();
+            if (lost) {
+                reason = "the drive reports " + hex4(code) + ", which this config lists as a lost reference";
+            }
+            reply.emplace("configured", ProtoValue(configured));
+            reply.emplace("fault_code", ProtoValue(hex4(code)));
+            reply.emplace("warning", ProtoValue(controller_->drive_warning()));
+            reply.emplace("valid", ProtoValue(configured && !lost));
+            if (!reason.empty()) {
+                reply.emplace("reason", ProtoValue(reason));
+            }
+        }
+        result.emplace("is_abs_enc_valid", ProtoValue(std::move(reply)));
+    }
+    // Hard-stop homing (CiA402 mode 6). Blocks for the run and reports the drive's verdict; a homing
+    // failure is a result, not an exception, so a caller can retry with a different threshold.
+    if (const ProtoValue* const rq = find_attr(command, "home")) {
+        const ProtoStruct* const a = rq->get<ProtoStruct>();
+        if (a == nullptr) {
+            throw Error("home expects {direction, speed_rpm, acceleration_rpm_per_s?, offset_revolutions?, torque_percent?, timeout_s?}");
+        }
+        ethercat::servo::HomingParams p;
+        const std::string dir = opt_attr<std::string>(*a, "direction").value_or("negative");
+        if (dir != "negative" && dir != "positive") {
+            throw Error("home: 'direction' must be \"negative\" or \"positive\" (got '" + dir + "')");
+        }
+        p.negative_direction = dir == "negative";
+        p.speed_rpm = req_num(*a, "speed_rpm");
+        p.accel_rpm_per_s = opt_num(*a, "acceleration_rpm_per_s", 0.0);
+        p.offset_revs = opt_num(*a, "offset_revolutions", 0.0);
+        p.torque_percent = opt_num(*a, "torque_percent", 0.0);
+        p.timeout_s = opt_num(*a, "timeout_s", 120.0);
+        ProtoStruct reply;
+        reply.emplace("homed", ProtoValue(controller_->home(p)));
+        if (const std::string err = controller_->homing_error(); !err.empty()) {
+            reply.emplace("error", ProtoValue(err));
+        }
+        result.emplace("home", ProtoValue(std::move(reply)));
+    }
     if (const ProtoValue* const rq = find_attr(command, "sdo_read")) {
         const SdoRequest r = parse_sdo_request(*rq, "sdo_read", false);
         try {
@@ -565,6 +688,7 @@ ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
     if (result.empty()) {
         throw std::runtime_error(
             "unknown do_command; supported keys (each a bool): fault_reset, enable, disable, status; "
+            "home {direction, speed_rpm, ...}; "
             "get_motor_voltage, get_motor_current_actual_value, get_motor_drive_modes (converted SDO reads); "
             "sdo_read / sdo_write {index, sub, type, value} (manufacturer-specific objects 0x2000-0x5FFF)");
     }

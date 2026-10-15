@@ -15,6 +15,7 @@
 #include "ethercat/util.hpp"
 #include "viam/lib/motion_mode.hpp"
 #include "viam/lib/motion_profile.hpp"
+#include "viam/lib/sdo_codec.hpp"
 
 namespace ethercat::servo {
 
@@ -180,6 +181,8 @@ void ServoController::reset_run_state() {
     motion_slot_.store(0, std::memory_order_relaxed);                               // free the single-in-flight slot on (re)start
     state_.expected_wkc.store(master_->expected_wkc(), std::memory_order_relaxed);  // constant; read lock-free by last_error()
     lifecycle_ = Init{};
+    state_.homing_state.store(static_cast<std::uint8_t>(HomingState::Idle), std::memory_order_relaxed);
+    state_.homed.store(false, std::memory_order_relaxed);  // an incremental reference does not survive a restart
     last_cw_ = 0;
     if (motion_) {
         motion_->reset();  // the mode's per-run RT state (handshake/latches/generator) for reuse
@@ -490,9 +493,72 @@ bool ServoController::estop_engaged() const noexcept {
            state_.drive_fault_code.load(std::memory_order_relaxed) == config_.estop_fault_code;
 }
 
+std::uint16_t ServoController::drive_fault_code() const noexcept {
+    return state_.drive_fault_code.load(std::memory_order_relaxed);
+}
+
+bool ServoController::drive_warning() const noexcept {
+    return state_.drive_warning.load(std::memory_order_relaxed);
+}
+
+const ServoConfig::AbsoluteEncoder& ServoController::absolute_encoder() const noexcept {
+    return config_.absolute_encoder;
+}
+
 bool ServoController::emergency_stopped() const noexcept {
     const std::shared_lock<std::shared_mutex> lk(api_mutex_);
     return estop_engaged();
+}
+
+const char* to_string(HomingState state) noexcept {
+    switch (state) {
+        case HomingState::Idle:
+            return "idle";
+        case HomingState::Running:
+            return "running";
+        case HomingState::Done:
+            return "done";
+        case HomingState::Failed:
+            return "failed";
+    }
+    return "?";
+}
+
+const char* to_string(HomingFail fail) noexcept {
+    switch (fail) {
+        case HomingFail::None:
+            return "";
+        case HomingFail::ModeNotAdopted:
+            return "the drive did not adopt homing mode (0x6061 never echoed 6)";
+        case HomingFail::DriveError:
+            return "the drive reported a homing error (statusword bit 13)";
+        case HomingFail::Timeout:
+            return "the drive did not attain home within the timeout";
+        case HomingFail::Cancelled:
+            return "cancelled by stop or disable";
+        case HomingFail::DriveFault:
+            return "the drive faulted during the run";
+    }
+    return "?";
+}
+
+std::string HomingParams::validate() const {
+    if (!(speed_rpm > 0.0) || !std::isfinite(speed_rpm)) {
+        return "speed must be positive";
+    }
+    if (!(accel_rpm_per_s >= 0.0) || !std::isfinite(accel_rpm_per_s)) {
+        return "acceleration must be >= 0";
+    }
+    if (!(offset_revs >= 0.0) || !std::isfinite(offset_revs)) {
+        return "offset must be >= 0 (the direction sets its sign)";
+    }
+    if (torque_percent < 0.0 || torque_percent > 300.0 || !std::isfinite(torque_percent)) {
+        return "torque percent must be within 0..300";
+    }
+    if (!(timeout_s > 0.0) || !std::isfinite(timeout_s)) {
+        return "timeout must be positive";
+    }
+    return {};
 }
 
 const char* ServoController::motion_mode_name() const noexcept {
@@ -615,6 +681,14 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
             motion_->reset();  // likewise: enable() re-energizes into a hold
             return ControlWord::disable_voltage();
         }
+        if (batch.start_homing.has_value()) {
+            lifecycle_ = Homing{};
+            homing_cycles_ = 0;
+            homing_echo_wait_ = 0;
+            homing_timeout_cycles_ = batch.start_homing->timeout_cycles;
+            motion_->reset();
+            return ControlWord::enable_operation();  // bit 4 low, so the start edge next cycle is real
+        }
         if (batch.quick_stop) {
             return ControlWord::quick_stop();
         }
@@ -627,6 +701,49 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
             abort_active_move(f == MotionFault::ModeNotAdopted ? RtError::ModeMismatch : RtError::HandshakeTimeout);
         }
         return cw;
+    }
+    if (std::holds_alternative<Homing>(lifecycle_)) {
+        if (dev == Cia402State::Fault || bus_fault) {
+            finish_homing(HomingFail::DriveFault);
+            return enter_resetting(ctx);
+        }
+        if (batch.disable || batch.halt || batch.quick_stop) {  // the operator's stop wins over the run
+            finish_homing(HomingFail::Cancelled);
+            if (batch.disable) {
+                lifecycle_ = Disabled{};
+            }
+            return ControlWord::disable_voltage();
+        }
+        if (f_mode_wr_) {  // a map that carries 0x6060: the PDO governs, so the loop writes mode 6 too
+            ctx.store<cia402::ModeOfOperation::type>(*f_mode_wr_, static_cast<std::int8_t>(Cia402Mode::Homing));
+        }
+        const bool echoed =
+            !f_mode_disp_ || ctx.load<cia402::ModeDisplay::type>(*f_mode_disp_) == static_cast<std::int8_t>(Cia402Mode::Homing);
+        if (!echoed) {
+            if (++homing_echo_wait_ >= kModeEchoCycles) {
+                finish_homing(HomingFail::ModeNotAdopted);
+            }
+            return ControlWord::enable_operation();
+        }
+        if (status.homing_error()) {
+            finish_homing(HomingFail::DriveError);
+            return ControlWord::with_halt(ControlWord::enable_operation(), true);
+        }
+        if (status.homing_attained()) {
+            // The drive rezeroed 0x6064 at the offset point, so the software zero must go with it for
+            // position_revs() to read 0 at home.
+            state_.zero_offset_counts.store(0, std::memory_order_relaxed);
+            state_.homed.store(true, std::memory_order_release);
+            finish_homing(HomingFail::None);
+            return ControlWord::enable_operation();
+        }
+        if (++homing_cycles_ >= homing_timeout_cycles_) {
+            finish_homing(HomingFail::Timeout);
+            return ControlWord::with_halt(ControlWord::enable_operation(), true);
+        }
+        // Bit 4 starts the procedure and stays high for its duration (in homing mode it is the
+        // "homing operation start" bit, not the profile-position new-set-point).
+        return ControlWord::with_new_setpoint(ControlWord::enable_operation(), true);
     }
     if (std::holds_alternative<Resetting>(lifecycle_)) {
         if (batch.disable) {  // operator override
@@ -682,7 +799,8 @@ void ServoController::publish_state(CycleContext& ctx, Status status, std::int32
     const bool at_target = motion_->is_target_reached(fb);
     // Moving: the mode commands motion, a positioning move is still under way, or the shaft is not at
     // rest (a ramp-down after set_rpm(0), which no command reflects).
-    const bool moving = powered && (motion_->is_moving() || (move_active && !at_target) || !pos_stable);
+    const bool moving =
+        powered && (std::holds_alternative<Homing>(lifecycle_) || motion_->is_moving() || (move_active && !at_target) || !pos_stable);
     state_.moving.store(moving, std::memory_order_relaxed);
     state_.mode_echo.store(f_mode_disp_ ? ctx.load<cia402::ModeDisplay::type>(*f_mode_disp_) : std::int8_t{0}, std::memory_order_relaxed);
 
@@ -708,6 +826,7 @@ void ServoController::publish_state(CycleContext& ctx, Status status, std::int32
     // up ("code pending" collapses to the rare hard-drop race only).
     const std::uint16_t drive_code = f_fault_code_ ? ctx.load<std::uint16_t>(*f_fault_code_) : 0;
     state_.drive_fault_code.store(drive_code, std::memory_order_relaxed);
+    state_.drive_warning.store(status.warning(), std::memory_order_relaxed);
     state_.drive_faulted.store(status.fault(), std::memory_order_release);
     // Controller tier: the published mirror of the latch (tracks abort, clears on fault_reset).
     rt_error_.store(latched_ctrl_error_, std::memory_order_release);
@@ -1081,6 +1200,146 @@ void ServoController::await_move(std::uint32_t generation) {
         }
         wake_seq_.wait(seq, std::memory_order_acquire);  // block until a wake bump (or a spurious wake -> re-check)
     }
+}
+
+// SDO-write the standard homing objects, then the configured torque object. Non-RT, run before the
+// RT loop is told to start: a refused object fails home() with the drive's abort code.
+void ServoController::write_homing_objects(const HomingParams& p) {
+    const auto write = [this](std::uint16_t index, std::uint8_t sub, auto value) {
+        std::array<std::byte, sizeof(value)> raw{};
+        store_le<decltype(value)>(raw, value);
+        sdo_write(index, sub, raw);
+    };
+    const double cpr = config_.counts_per_rev;
+    const double ratio = config_.gear_ratio;
+    // Resolve the torque object first: a request the config cannot satisfy must fail before any
+    // homing object is written, not halfway through.
+    const sdo_codec::TypeInfo* torque_type = nullptr;
+    if (p.torque_percent > 0.0) {
+        if (config_.homing_torque.index == 0) {
+            throw Error("home: torque_percent needs the 'homing_torque_object' config attribute (the object is drive-specific)");
+        }
+        torque_type = sdo_codec::find_type(config_.homing_torque.type);
+        if (torque_type == nullptr) {
+            throw Error("home: unknown homing_torque_object type '" + config_.homing_torque.type + "'");
+        }
+    }
+    write(0x6098, 0, static_cast<std::int8_t>(p.negative_direction ? -4 : -3));
+    write(0x6099, 1, static_cast<std::uint32_t>(rpm_to_device_velocity(p.speed_rpm, cpr, ratio)));
+    if (p.accel_rpm_per_s > 0.0) {
+        write(0x609A, 0, static_cast<std::uint32_t>(rpm_to_device_velocity(p.accel_rpm_per_s, cpr, ratio)));
+    }
+    // The back-off moves away from the stop, so its sign is the opposite of the approach direction.
+    const std::int32_t offset = revs_to_counts(p.offset_revs, cpr, ratio);
+    write(0x607C, 0, p.negative_direction ? offset : -offset);
+    if (torque_type != nullptr) {
+        sdo_codec::Input in;
+        in.number = p.torque_percent * config_.homing_torque.units_per_percent;
+        sdo_write(config_.homing_torque.index, config_.homing_torque.sub, torque_type->encode(in));
+    }
+}
+
+// Select a CiA402 mode on the drive by SDO (non-RT). In a map that carries 0x6060 the RT loop writes
+// the same value every cycle and the PDO governs; this is what moves a drive whose map does not.
+void ServoController::select_drive_mode(Cia402Mode mode) {
+    const std::array<std::byte, 1> v{static_cast<std::byte>(static_cast<std::uint8_t>(mode))};
+    sdo_write(0x6060, 0, v);
+}
+
+// Park until the RT loop leaves Homing. Same wake protocol as await_move: no clock, the timeout is
+// the RT loop's own cycle bound.
+bool ServoController::await_homing() {
+    for (;;) {
+        const std::uint64_t seq = wake_seq_.load(std::memory_order_acquire);
+        const auto st = static_cast<HomingState>(state_.homing_state.load(std::memory_order_acquire));
+        if (st != HomingState::Running) {
+            return st == HomingState::Done;
+        }
+        if (stopping_.load(std::memory_order_acquire) || rt_exited_.load(std::memory_order_acquire)) {
+            throw Error("home: controller stopped / RT loop not alive");
+        }
+        wake_seq_.wait(seq, std::memory_order_acquire);
+    }
+}
+
+void ServoController::finish_homing(HomingFail fail) noexcept {
+    state_.homing_fail.store(static_cast<std::uint8_t>(fail), std::memory_order_relaxed);
+    state_.homing_state.store(static_cast<std::uint8_t>(fail == HomingFail::None ? HomingState::Done : HomingState::Failed),
+                              std::memory_order_release);
+    homing_cycles_ = 0;
+    homing_echo_wait_ = 0;
+    motion_->reset();  // no command survives a home: the run ends in a hold at the new origin
+    lifecycle_ = Enabling{};
+    mode_echo_wait_ = 0;
+    bump_wake();
+}
+
+bool ServoController::home(const HomingParams& params) {
+    if (const std::string err = params.validate(); !err.empty()) {
+        throw Error("home: " + err);
+    }
+    maybe_recover_bus();
+    std::uint32_t g = 0;
+    std::uint32_t timeout_cycles = 0;
+    {
+        const std::shared_lock<std::shared_mutex> lk(api_mutex_);
+        if (degraded_.load(std::memory_order_acquire)) {
+            throw Error("home unavailable: " + (degraded_reason_.empty() ? last_error() : degraded_reason_));
+        }
+        if (estop_engaged()) {
+            throw Error("home: emergency stop engaged -- release it before homing");
+        }
+        if (!state_.powered.load(std::memory_order_acquire)) {
+            throw Error("home: the drive is not energized");
+        }
+        timeout_cycles = static_cast<std::uint32_t>(params.timeout_s * static_cast<double>(config_.target_loop_rate_hz));
+        g = next_generation_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (!try_claim_motion_slot(g)) {  // homing owns the single-in-flight slot for the whole run
+            throw Error("home: a motion operation is already in progress");
+        }
+    }
+    bool attained = false;
+    try {
+        write_homing_objects(params);
+        select_drive_mode(Cia402Mode::Homing);
+        state_.homing_fail.store(static_cast<std::uint8_t>(HomingFail::None), std::memory_order_relaxed);
+        state_.homing_state.store(static_cast<std::uint8_t>(HomingState::Running), std::memory_order_release);
+        {
+            const std::shared_lock<std::shared_mutex> lk(api_mutex_);
+            (void)commands_.push(Command{StartHoming{g, timeout_cycles}});
+        }
+        attained = await_homing();
+    } catch (...) {
+        state_.homing_state.store(static_cast<std::uint8_t>(HomingState::Failed), std::memory_order_release);
+        // Restore the running mode whatever happened, so a failed home never leaves the drive in
+        // homing mode with the enable ladder waiting for an echo that will not come.
+        try {
+            select_drive_mode(commanded_cia402_mode());
+        } catch (const std::exception& e) {
+            ETHERCAT_LOG_ERROR("servo", "home: restoring the running mode failed: {}", e.what());
+        }
+        release_motion_slot(g);
+        throw;
+    }
+    select_drive_mode(commanded_cia402_mode());
+    release_motion_slot(g);
+    ETHERCAT_LOG_INFO("servo", "slave {}: homing {}", config_.slave_id, attained ? "attained" : homing_error());
+    return attained;
+}
+
+bool ServoController::homed() const noexcept {
+    return state_.homed.load(std::memory_order_acquire);
+}
+
+HomingState ServoController::homing_state() const noexcept {
+    return static_cast<HomingState>(state_.homing_state.load(std::memory_order_acquire));
+}
+
+std::string ServoController::homing_error() const {
+    if (static_cast<HomingState>(state_.homing_state.load(std::memory_order_acquire)) != HomingState::Failed) {
+        return {};
+    }
+    return to_string(static_cast<HomingFail>(state_.homing_fail.load(std::memory_order_relaxed)));
 }
 
 void ServoController::go_to(double rpm, double position) {

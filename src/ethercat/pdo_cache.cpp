@@ -142,6 +142,8 @@ CommandBatch CommandQueue::drain() noexcept {
                 } else if constexpr (std::is_same_v<T, SetVelocity>) {
                     batch.set_velocity = cmd;       // latest-wins
                     batch.halt_supersedes = false;  // a motion command after a halt supersedes it
+                } else if constexpr (std::is_same_v<T, StartHoming>) {
+                    batch.start_homing = cmd;
                 } else if constexpr (std::is_same_v<T, Enable>) {
                     batch.enable = true;
                 } else if constexpr (std::is_same_v<T, Disable>) {

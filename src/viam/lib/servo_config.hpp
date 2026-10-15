@@ -83,6 +83,28 @@ struct ServoConfig {
     // skipped and the drive falls back to disable-voltage on stop. >0 = configured and asserted at
     // bring-up. Standard CiA402 tunable; from config, never a hardcoded device value.
     std::uint32_t quick_stop_decel = 0;
+    // Object that bounds motor current during hard-stop homing, and so sets the contact threshold.
+    // No CiA402 object standardises it, so it comes from config: index 0 = not configured (the drive
+    // keeps its own value). `type` is an sdo_codec type name.
+    struct HomingTorqueObject {
+        std::uint16_t index = 0;
+        std::uint8_t sub = 0;
+        std::string type = "u16";
+        double units_per_percent = 10.0;  // object units for one percent of rated current
+    };
+    HomingTorqueObject homing_torque;
+    // Optional absolute-encoder declaration. `index/sub/type` name the manufacturer-specific object
+    // that holds the encoder mode and `equals` the value meaning "retains position across power
+    // cycles"; `invalid_codes` are the 0x603F values that mean the retained position is gone (these
+    // are warnings on some drives, so they never raise the fault bit). index 0 = not declared.
+    struct AbsoluteEncoder {
+        std::uint16_t index = 0;
+        std::uint8_t sub = 0;
+        std::string type = "u16";
+        double equals = 0.0;
+        std::vector<std::uint16_t> invalid_codes;
+    };
+    AbsoluteEncoder absolute_encoder;
     // 0x603F value the drive reports while its emergency-stop input is engaged (drive-specific, so it
     // comes from config). 0 = not configured. While it is present the motion API refuses with
     // "emergency stop engaged" and no fault-reset edges are presented.

@@ -118,6 +118,12 @@ struct SetTarget {
 struct SetVelocity {
     std::int32_t velocity = 0;  // PV target velocity, device units
 };
+// Run the drive's homing procedure (mode 6). The objects are SDO-written before the command is
+// pushed; the RT loop only presents the start bit and bounds the run.
+struct StartHoming {
+    std::uint32_t generation = 0;
+    std::uint32_t timeout_cycles = 0;
+};
 struct Enable {};
 struct Disable {};
 struct Halt {};
@@ -125,7 +131,7 @@ struct QuickStop {};
 struct FaultReset {};
 struct SetZero {};
 
-using Command = std::variant<SetTarget, SetVelocity, Enable, Disable, Halt, QuickStop, FaultReset, SetZero>;
+using Command = std::variant<SetTarget, SetVelocity, StartHoming, Enable, Disable, Halt, QuickStop, FaultReset, SetZero>;
 static_assert(std::is_trivially_copyable_v<Command>, "Command must be trivially copyable for the lock-free queue");
 // boost::lockfree::queue additionally requires a trivial destructor; assert it
 // so a future non-trivial Command alternative fails at compile, not at link.
@@ -136,6 +142,7 @@ static_assert(std::is_trivially_destructible_v<Command>, "Command must be trivia
 struct CommandBatch {
     std::optional<SetTarget> set_target;
     std::optional<SetVelocity> set_velocity;
+    std::optional<StartHoming> start_homing;
     bool enable = false;
     bool disable = false;
     bool halt = false;
@@ -151,7 +158,8 @@ struct CommandBatch {
     bool halt_supersedes = false;
 
     bool any() const noexcept {
-        return set_target.has_value() || set_velocity.has_value() || enable || disable || halt || quick_stop || fault_reset || set_zero;
+        return set_target.has_value() || set_velocity.has_value() || start_homing.has_value() || enable || disable || halt || quick_stop ||
+               fault_reset || set_zero;
     }
 };
 

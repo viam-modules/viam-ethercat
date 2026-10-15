@@ -44,6 +44,8 @@ Add a motor component with one of the models above. Attributes:
 | `rt_priority` | no | 80 | SCHED_FIFO priority (1..99) |
 | `emergency_stop_fault_code` | no | none | 0x603F value the drive reports while its emergency-stop input is engaged (e.g. `"0xFF3A"`); while present, `status` reports `emergency_stop: true`, motion calls fail with "emergency stop engaged", and no automatic fault-reset edges are sent (the `fault_reset` do_command still works, for a drive that latches the stop) |
 | `quick_stop_decel_rpm_per_s` | no | 0 (not configured) | deceleration written to the drive's 0x6085: its quick stop, its E-stop input ramp, and in `profile` mode the module's own `stop()`; in `profile` mode the drive must hold 0x605A = 2 |
+| `absolute_encoder` | no | none | declares the drive object that says the encoder retains position, and the 0x603F codes that mean it lost it: `{"index": "0x2A9C", "sub": 4, "type": "u16", "equals": 2, "invalid_codes": ["0xFF3C", "0xFF3D", "0xFF0F"]}`; read by the `is_abs_enc_valid` verb |
+| `homing_torque_object` | no | none | drive object that bounds motor current during hard-stop homing, e.g. `{"index": "0x2A08", "sub": 0, "type": "u32", "units_per_percent": 10}`; the type and scale are the drive's own (read the object first -- a wrong width is refused); required for the `home` verb's `torque_percent` |
 | `max_acceleration_rpm_per_s` | no | `max_rpm` per second | ramp acceleration of the master-side trajectory in `csp`; ignored in `profile` |
 
 ### Control mode
@@ -118,12 +120,23 @@ matter:
   (`"log_configuration": {"level": "debug"}` on the motor). `debug` traces every SDO (object,
   payload, decoded abort) and AL state request during bring-up; `info` prints one line per
   bring-up phase and one per fault-code change.
+- `{"is_abs_enc_valid": true}` answers whether the drive's absolute encoder is set to retain position
+  and still holds it: `{"valid": true, "configured": true, "mode": 2, "fault_code": "0x0000", "warning": false}`, or
+  `valid: false` with a `reason`. Needs the `absolute_encoder` attribute; without it the answer is
+  false with that as the reason. The codes it treats as a lost reference are warnings on some drives,
+  so they never raise the fault bit and are read from the live 0x603F instead.
+- Hard-stop homing (CiA402 mode 6, methods -4 and -3): `{"home": {"direction": "negative", "speed_rpm": 20,
+  "torque_percent": 20, "offset_revolutions": 0.25, "acceleration_rpm_per_s": 100, "timeout_s": 120}}`. The
+  drive drives into the mechanical stop until motor current reaches the threshold, backs off by the offset
+  and calls that zero; the module clears its software zero with it. The call blocks for the run and replies
+  `{"homed": true}`, or `{"homed": false, "error": "..."}` when the drive reports a homing error or the run
+  times out. `status` carries `homed`, `homing` and, after a failure, `homing_error`.
 - Raw SDO access to manufacturer-specific objects (0x2000-0x5FFF) and 0x1010 (store parameters) for commissioning:
   `{"sdo_read": {"index": "0x2A9C", "sub": 4, "type": "u16"}}`,
   `{"sdo_write": {"index": "0x2A9C", "sub": 4, "type": "u16", "value": 2}}`. Types `u8 i8 u16 i16 u32 i32
   string bytes`; values are numbers or `"0x.."` / hex-byte strings. A drive refusal returns
   `{"ok": false, "abort_code": "0x06090030", "error": "..."}`; writes are refused while the motor moves.
-- `do_command` verbs: `status`, `fault_reset`, `enable`, `disable`,
+- `do_command` verbs: `status`, `fault_reset`, `enable`, `disable`, `home`, `is_abs_enc_valid`,
   `get_motor_voltage`, `get_motor_current_actual_value`,
   `get_motor_drive_modes`.
 

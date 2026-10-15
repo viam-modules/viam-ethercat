@@ -14,6 +14,7 @@ enum class Cia402Mode : std::int8_t {
     ProfilePosition = 1,
     ProfileVelocity = 3,
     CyclicSyncPosition = 8,  // CSP: master streams target position (0x607A) every cycle
+    Homing = 6,              // HM: the drive runs its own homing procedure (0x6098 method)
 };
 
 // The eight canonical CiA402 drive states (the DS402 state machine).
@@ -83,6 +84,14 @@ struct Status {
     bool following_error() const noexcept {
         return bit(13);
     }  // position deviation
+
+    // The same two bits in Homing mode, where 12 means the procedure finished and 13 that it failed.
+    bool homing_attained() const noexcept {
+        return bit(12);
+    }
+    bool homing_error() const noexcept {
+        return bit(13);
+    }
 
     // Decode the drive state from `raw` per the DS402 mask table.
     Cia402State decode() const noexcept;

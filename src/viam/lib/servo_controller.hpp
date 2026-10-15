@@ -73,6 +73,7 @@ struct ControllerState {
     // (RT, sole writer); cross-tier skew is benign.
     std::atomic<bool> wkc_faulted{false};                // bus tier = master_->fault(); pairs with fault_wkc
     std::atomic<bool> drive_faulted{false};              // drive tier = status.fault() (bit 3); pairs with drive_fault_code
+    std::atomic<bool> drive_warning{false};              // statusword bit 7: the drive flags something short of a fault
     std::atomic<std::uint16_t> drive_fault_code{0};      // 0x603F live-read every faulted cycle; relaxed before the drive_faulted release
     std::atomic<std::uint16_t> bringup_al_code{0};       // ESC AL status code at a bring-up give-up (e.g. 0x0027 free-run); 0 = none
     std::atomic<std::uint64_t> loop_cycle{0};            // heartbeat counter
@@ -80,6 +81,28 @@ struct ControllerState {
     std::atomic<std::uint32_t> active_generation{0};     // gen RT adopted from the applied SetTarget (post-coalescing)
     std::atomic<std::uint32_t> completed_generation{0};  // gen that reached target; RT stores-release then notify (no lock)
     std::atomic<std::uint32_t> failed_generation{0};     // gen that failed (handshake timeout / cancelled); wakes its waiter to throw
+    std::atomic<std::uint8_t> homing_state{0};           // HomingState; set by the RT loop, read by home()
+    std::atomic<std::uint8_t> homing_fail{0};            // HomingFail reason when homing_state == Failed
+    std::atomic<bool> homed{false};                      // a homing run succeeded in this session
+};
+
+// The drive's homing procedure as seen by the API: idle until the first run, then running while the
+// RT loop presents the start bit, and terminal after it.
+enum class HomingState : std::uint8_t { Idle, Running, Done, Failed };
+enum class HomingFail : std::uint8_t { None, ModeNotAdopted, DriveError, Timeout, Cancelled, DriveFault };
+const char* to_string(HomingState state) noexcept;
+const char* to_string(HomingFail fail) noexcept;
+
+// One hard-stop homing run: CiA402 mode 6 with method -4 (drive into the negative stop) or -3 (the
+// positive one), the drive detecting contact by motor current. User units; the controller converts.
+struct HomingParams {
+    bool negative_direction = true;
+    double speed_rpm = 0.0;        // 0x6099:01 approach speed
+    double accel_rpm_per_s = 0.0;  // 0x609A; 0 leaves the drive's value
+    double offset_revs = 0.0;      // 0x607C back-off magnitude; the sign points away from the stop
+    double torque_percent = 0.0;   // contact threshold; needs a configured homing_torque object
+    double timeout_s = 120.0;      // the run fails if the drive has not attained home by then
+    std::string validate() const;  // "" when usable, else why not
 };
 
 // ServoController is the module's SlaveControl: it owns the RT policy and state, so it
@@ -188,6 +211,22 @@ class ServoController : public SlaveControl {
     const char* motion_mode_name() const noexcept;
     // The drive reports the configured emergency-stop fault code (lock-free, published state).
     bool emergency_stopped() const noexcept;
+    // The 0x603F code published this cycle, fault or warning alike (0 when none, or when the object
+    // is not in the TxPDO map).
+    std::uint16_t drive_fault_code() const noexcept;
+    // Statusword bit 7. Conditions a drive classes as warnings (an encoder battery, a lost absolute
+    // reference) never set the fault bit, so this is the only standard signal that one is present.
+    bool drive_warning() const noexcept;
+    // The absolute-encoder declaration from config (index 0 when absent).
+    const ServoConfig::AbsoluteEncoder& absolute_encoder() const noexcept;
+
+    // Run the drive's homing procedure and block until it ends. True when the drive attained home;
+    // false when it reported a homing error, timed out, or the run was cancelled (homing_error()
+    // says which). Throws on bad parameters, a refused SDO, or a state that cannot home.
+    bool home(const HomingParams& params);
+    bool homed() const noexcept;
+    HomingState homing_state() const noexcept;
+    std::string homing_error() const;  // "" unless the last run failed
 
    protected:
     // --- Device seams. The base is the generic CiA402 servo driver; a device subclass
@@ -229,8 +268,9 @@ class ServoController : public SlaveControl {
     struct Enabling {};  // climb to OperationEnabled once 0x6061 echoes the commanded mode
     struct Operational {};
     struct Resetting {};  // drive in Fault: present fault-reset edges until it clears, then Enabling
+    struct Homing {};     // the drive runs its own homing procedure; the loop holds the start bit
     struct Disabled {};   // operator de-energized; leaves on enable
-    using Lifecycle = std::variant<Init, Enabling, Operational, Resetting, Disabled>;
+    using Lifecycle = std::variant<Init, Enabling, Operational, Resetting, Homing, Disabled>;
 
     // The mode-specific motion semantics live in motion_; the controller delegates to it.
 
@@ -368,6 +408,9 @@ class ServoController : public SlaveControl {
     std::uint32_t reset_cycles_ = 0;            // cycles spent in Resetting (paces the fault-reset edges)
     std::uint32_t clear_streak_ = 0;            // consecutive non-Fault cycles in Resetting
     std::uint32_t mode_echo_wait_ = 0;          // Enabling: cycles at SwitchedOn with 0x6061 != commanded
+    std::uint32_t homing_cycles_ = 0;           // Homing: cycles since the start bit went high
+    std::uint32_t homing_timeout_cycles_ = 0;   // Homing: bound from the caller's timeout
+    std::uint32_t homing_echo_wait_ = 0;        // Homing: cycles 0x6061 has lagged mode 6
     std::int32_t prev_actual_ = 0;              // previous-cycle actual (instantaneous velocity estimate)
     bool first_cycle_ = true;                   // skip the velocity estimate on the first cycle
     // Noise-robust "stopped": a ring of the last N actual positions; stable when the window's range
@@ -409,7 +452,12 @@ class ServoController : public SlaveControl {
     bool gen_terminal(std::uint32_t gen) const noexcept;
     bool try_claim_motion_slot(std::uint32_t gen) noexcept;
     void release_motion_slot(std::uint32_t gen) noexcept;  // frees the slot if `gen` still owns it
-    bool motion_slot_busy() const noexcept;                // a live (non-terminal) blocking move holds the slot
+    // Homing helpers. The first three are non-RT (SDO on the caller's thread); finish_homing is RT.
+    void write_homing_objects(const HomingParams& params);
+    void select_drive_mode(Cia402Mode mode);
+    bool await_homing();
+    void finish_homing(HomingFail fail) noexcept;
+    bool motion_slot_busy() const noexcept;  // a live (non-terminal) blocking move holds the slot
     // emergency_stopped() without the lock, for callers that already hold api_mutex_.
     bool estop_engaged() const noexcept;
     // Submit a PV velocity setpoint (rpm to guarded device counts) without the slot check, for

@@ -9,8 +9,10 @@
 #include "ethercat/pdo_buffer.hpp"  // store_le, to build raw test bytes
 #include "test_harness.hpp"
 #include "viam/lib/servo_config.hpp"
+#include "viam/lib/servo_controller.hpp"  // HomingParams::validate
 
 using ethercat::Error;
+using ethercat::servo::HomingParams;
 using ethercat::servo::ServoConfig;
 
 namespace {
@@ -104,6 +106,34 @@ TEST("ServoConfig::validate rejects each invalid field with clear text") {
         ServoConfig c = good_config();
         c.command_queue_capacity = 0;
         CHECK_THROWS_MSG(c.validate(), Error, "command_queue_capacity");
+    }
+}
+
+// Homing parameters are validated before any SDO leaves the host, so a bad ask never reaches a
+// drive that would start moving into a hard stop with it.
+TEST("homing params reject what the drive cannot be asked") {
+    HomingParams p;
+    p.speed_rpm = 20.0;
+    CHECK(p.validate().empty());
+    {
+        HomingParams bad = p;
+        bad.speed_rpm = 0.0;
+        CHECK(bad.validate().find("speed") != std::string::npos);
+    }
+    {
+        HomingParams bad = p;
+        bad.offset_revs = -1.0;
+        CHECK(bad.validate().find("offset") != std::string::npos);
+    }
+    {
+        HomingParams bad = p;
+        bad.torque_percent = 400.0;
+        CHECK(bad.validate().find("torque") != std::string::npos);
+    }
+    {
+        HomingParams bad = p;
+        bad.timeout_s = 0.0;
+        CHECK(bad.validate().find("timeout") != std::string::npos);
     }
 }
 
