@@ -11,6 +11,7 @@ Two motor models ship in one module:
 |---|---|
 | `viam:ethercat:servo` | any conformant CiA402 EtherCAT servo drive |
 | `viam:ethercat:a6-servo` | ANCTL A6-EC series drives (adds the A6's vendor fault-reset, sync-fault code, and position-stability move-completion, since the A6 ties statusword bit 10 high) |
+| `viam:ethercat:gantry` | one linear axis driven by one of the motors above (`rdk:component:gantry`) |
 
 ## Requirements
 
@@ -139,6 +140,56 @@ matter:
 - `do_command` verbs: `status`, `fault_reset`, `enable`, `disable`, `home`, `is_abs_enc_valid`,
   `get_motor_voltage`, `get_motor_current_actual_value`,
   `get_motor_drive_modes`.
+
+## Single-axis gantry
+
+`viam:ethercat:gantry` turns one of the motors above into a linear axis: it owns the travel
+length, the millimetre scale and the bound that keeps a move inside the axis, and drives the
+motor through the standard motor API. It depends on the motor component and never opens the bus
+itself. It refuses to build if its dependency is not a `viam:ethercat` servo, since it needs this
+module's homing contract.
+
+There are no limit switches. Homing drives into a mechanical hard stop until motor current
+reaches `home_torque_percent`, backs off by `home_offset_mm` and calls that zero, so the axis
+needs a rigid end stop and a threshold tuned at low speed. `get_position` and
+`move_to_position` are refused until `home()` has succeeded.
+
+The axis also counts as referenced when the motor answers `is_abs_enc_valid` positively, so a
+drive whose encoder retains position needs no homing run after a restart. The objects and the
+codes behind that answer are declared on the motor, not here; the axis only reads the verdict and
+caches it.
+
+| Attribute | Required | Default | Meaning |
+|---|---|---|---|
+| `motor` | yes | — | name of the axis motor (also list it in `depends_on`) |
+| `length_mm` | yes | — | travel length of the axis |
+| `mm_per_rev` | yes | — | linear travel per motor revolution |
+| `gantry_mm_per_sec` | no | 0 | default speed when a move does not give one |
+| `home_direction` | no | `negative` | `negative` homes into the negative stop (method -4), `positive` into the other (-3) |
+| `home_mm_per_sec` | yes | — | approach speed of the homing move |
+| `home_accel_mm_per_sec2` | no | 0 (drive's own) | homing acceleration |
+| `home_torque_percent` | no | 0 (drive's own) | contact threshold, needs `homing_torque_object` on the motor |
+| `home_offset_mm` | no | 0 | back-off from the stop; the axis zero |
+| `home_timeout_s` | no | 120 | the home fails if the drive has not attained it by then |
+
+```json
+{
+  "name": "x-axis",
+  "api": "rdk:component:gantry",
+  "model": "viam:ethercat:gantry",
+  "attributes": {
+    "motor": "x-motor",
+    "length_mm": 500,
+    "mm_per_rev": 40,
+    "gantry_mm_per_sec": 50,
+    "home_direction": "negative",
+    "home_mm_per_sec": 5,
+    "home_torque_percent": 20,
+    "home_offset_mm": 2
+  },
+  "depends_on": ["x-motor"]
+}
+```
 
 ## Third-party code
 

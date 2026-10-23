@@ -1,4 +1,5 @@
 #include "viam/module/servo_motor.hpp"
+#include "viam/module/proto_attrs.hpp"
 
 #include <algorithm>
 #include <array>
@@ -29,39 +30,12 @@
 
 namespace ethercat::servo {
 
+using attrs::find_attr;
+using attrs::opt_attr;
+using attrs::opt_num;
+using attrs::req_num;
+
 namespace {
-
-// --- attribute helpers (numbers arrive as double; int is upcast by the SDK) ---
-
-const ProtoValue* find_attr(const ProtoStruct& attrs, const std::string& key) {
-    const auto it = attrs.find(key);
-    return it == attrs.end() ? nullptr : &it->second;
-}
-
-template <class T>
-std::optional<T> opt_attr(const ProtoStruct& attrs, const std::string& key) {
-    const ProtoValue* const v = find_attr(attrs, key);
-    if (v == nullptr) {
-        return std::nullopt;
-    }
-    const T* const p = v->get<T>();
-    if (p == nullptr) {
-        throw Error("config attribute '" + key + "' has the wrong type");
-    }
-    return *p;
-}
-
-double req_num(const ProtoStruct& attrs, const std::string& key) {
-    const auto v = opt_attr<double>(attrs, key);
-    if (!v) {
-        throw Error("required config attribute '" + key + "' is missing");
-    }
-    return *v;
-}
-
-double opt_num(const ProtoStruct& attrs, const std::string& key, double dflt) {
-    return opt_attr<double>(attrs, key).value_or(dflt);
-}
 
 namespace codec = ethercat::servo::sdo_codec;
 
@@ -339,15 +313,6 @@ ProtoStruct sdo_refusal(const ethercat::SdoError& e) {
     return out;
 }
 
-bool command_flag(const ProtoStruct& command, const char* key) {
-    const auto it = command.find(key);
-    if (it == command.end()) {
-        return false;
-    }
-    const bool* const b = it->second.get<bool>();
-    return b != nullptr && *b;
-}
-
 // --- do_command SDO reads: always the standard CiA402 objects (no config, no override) -----
 // get_motor_voltage=0x6079 (U32 mV -> V /1000), get_motor_current=0x6078 (I16 per-mille of the
 // motor's rated current -> A), get_motor_drive_modes=0x6502 (U32 bitmask). A drive that lacks an
@@ -540,26 +505,35 @@ void ServoMotor::stop(const ProtoStruct& /*extra*/) {
 
 ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
     ProtoStruct result;
-    if (command_flag(command, "fault_reset")) {
+    if (attrs::flag(command, "fault_reset")) {
         controller_->request_fault_reset();
         result.emplace("fault_reset", ProtoValue(true));
     }
-    if (command_flag(command, "enable")) {
+    if (attrs::flag(command, "enable")) {
         controller_->enable();
         result.emplace("enable", ProtoValue(true));
     }
-    if (command_flag(command, "disable")) {
+    if (attrs::flag(command, "disable")) {
         controller_->disable();
         result.emplace("disable", ProtoValue(true));
     }
-    if (command_flag(command, "status")) {
+    // Identity of the driver behind this motor, for a component that needs its contract (the
+    // gantry checks it at config time rather than discovering a missing verb mid-home).
+    if (attrs::flag(command, "describe")) {
+        ProtoStruct d;
+        d.emplace("driver", ProtoValue(std::string("viam:ethercat")));
+        d.emplace("contract", ProtoValue(1.0));
+        d.emplace("homing", ProtoValue(true));
+        result.emplace("describe", ProtoValue(std::move(d)));
+    }
+    if (attrs::flag(command, "status")) {
         result.emplace("status", ProtoValue(get_status()));
     }
     // Standard-CiA402 SDO reads (no config, no override). On success, the converted value goes under
     // the clear key. On SDO abort/failure (e.g. the A6 does not implement 0x6079/0x6078), the value is
     // reported as 0 and the abort text lands under a secondary "<key>_diag" key (not a *_error key), so
     // moves are unaffected.
-    if (command_flag(command, "get_motor_voltage")) {
+    if (attrs::flag(command, "get_motor_voltage")) {
         try {
             const auto mv = read_std_sdo<std::uint32_t>(*controller_, kDcLinkVoltage);
             result.emplace("voltage_volts", ProtoValue(static_cast<double>(mv) / 1000.0));
@@ -568,7 +542,7 @@ ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
             result.emplace("voltage_volts_diag", ProtoValue(std::string("0x6079 unavailable (reporting 0): ") + e.what()));
         }
     }
-    if (command_flag(command, "get_motor_current_actual_value")) {
+    if (attrs::flag(command, "get_motor_current_actual_value")) {
         try {
             const auto permille = read_std_sdo<std::int16_t>(*controller_, kCurrentActual);
             result.emplace("current_amps", ProtoValue((static_cast<double>(permille) / 1000.0) * controller_->rated_current_amps()));
@@ -577,7 +551,7 @@ ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
             result.emplace("current_amps_diag", ProtoValue(std::string("0x6078 unavailable (reporting 0): ") + e.what()));
         }
     }
-    if (command_flag(command, "get_motor_drive_modes")) {
+    if (attrs::flag(command, "get_motor_drive_modes")) {
         try {
             const auto bits = read_std_sdo<std::uint32_t>(*controller_, kSupportedDriveModes);
             result.emplace("drive_modes", ProtoValue(decode_drive_modes(bits)));
@@ -591,7 +565,7 @@ ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
     // Is the drive's absolute encoder configured to retain position, and has it kept it? Reads the
     // declared mode object and the live 0x603F. Reported as data (never an exception) so a caller
     // can branch on it: `valid` false with a reason means home the axis.
-    if (command_flag(command, "is_abs_enc_valid")) {
+    if (attrs::flag(command, "is_abs_enc_valid")) {
         const ServoConfig::AbsoluteEncoder& enc = controller_->absolute_encoder();
         ProtoStruct reply;
         if (enc.index == 0) {
@@ -687,7 +661,7 @@ ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
     }
     if (result.empty()) {
         throw std::runtime_error(
-            "unknown do_command; supported keys (each a bool): fault_reset, enable, disable, status; "
+            "unknown do_command; supported keys (each a bool): describe, fault_reset, enable, disable, status; "
             "home {direction, speed_rpm, ...}; "
             "get_motor_voltage, get_motor_current_actual_value, get_motor_drive_modes (converted SDO reads); "
             "sdo_read / sdo_write {index, sub, type, value} (manufacturer-specific objects 0x2000-0x5FFF)");
