@@ -99,6 +99,11 @@ struct ServoConfig {
         double accel_rpm_per_s = 0.0;  // 0x609A; 0 leaves the drive's value
         double torque_percent = 0.0;   // contact threshold; 0 = do not clamp
         double timeout_s = 120.0;      // the run fails if the drive has not attained home by then
+        // Keep the datum from home() rather than making the operator run the sequence by hand:
+        // de-energize, write the origin, store it, restart so the drive will energize again. The
+        // persist_datum do_command does the same work for a drive the caller has already disabled,
+        // which is how this was verified on hardware. Settable to false to get that behaviour back.
+        bool auto_persist_datum = true;
         // Object that bounds motor current during the run. No CiA402 object standardises it, so it
         // comes from config: index 0 = not configured. `type` is an sdo_codec type name.
         struct TorqueObject {
