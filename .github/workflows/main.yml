@@ -72,6 +72,15 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+      # ThreadSanitizer disables ASLR for itself at startup, via
+      # personality(ADDR_NO_RANDOMIZE), and aborts when the call is refused:
+      #   ThreadSanitizer: CHECK failed: tsan_platform_linux.cpp:290
+      #   "((personality(old_personality | ADDR_NO_RANDOMIZE))) != ((-1))"
+      # Docker's default seccomp profile refuses it, so the test segfaults in
+      # TSan's own platform init, before any of this project's code runs. The
+      # job passed until the container image was rebuilt (SDK 0.44, #20), which
+      # is also when the first run against the new image happened.
+      options: --security-opt seccomp=unconfined
     # NOTE: this used to also run on a NATIVE arm64 runner, which is the only
     # authoritative check of the seqlock fence placement (x86 is TSO and hides
     # weak-ordering mistakes; qemu serializes to ~TSO too). We only target
