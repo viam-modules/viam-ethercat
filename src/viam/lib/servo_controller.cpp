@@ -1314,7 +1314,20 @@ void ServoController::await_move(std::uint32_t generation) {
             release_motion_slot(g);
             throw Error("move: drive faulted (" + last_error() + ")");
         }
-        wake_seq_.wait(seq, std::memory_order_acquire);  // block until a wake bump (or a spurious wake -> re-check)
+        if (!cancel_probe_) {
+            wake_seq_.wait(seq, std::memory_order_acquire);  // block until a wake bump (or a spurious wake -> re-check)
+            continue;
+        }
+        // ponytail: a 10 ms poll, since std::atomic::wait cannot time out to look at the probe. It
+        // costs a wakeup per 10 ms per parked move on the API thread; never touches the RT loop.
+        while (wake_seq_.load(std::memory_order_acquire) == seq) {
+            if (cancel_probe_()) {
+                halt();  // the mode's own decel ramp (PP: drive Halt on 0x6084; CSP: master trapezoid)
+                release_motion_slot(g);
+                throw Error("move cancelled by the caller: decelerating to a stop");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
     }
 }
 
