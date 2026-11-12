@@ -1,7 +1,9 @@
 #include "viam/module/gantry_axis.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <stdexcept>
 #include <utility>
@@ -171,7 +173,23 @@ void GantryAxis::move_to_position(const std::vector<movement_coordinate>& coordi
     }
     // The motor takes a signed revolution target and an unsigned speed; the sign of the target
     // carries the direction, so the speed is a magnitude in rpm.
-    motor_->go_to(speed / attrs_.mm_per_rev * 60.0, mm_to_revs(home_revs(status), c.position_mm), extra);
+    const double rpm = speed / attrs_.mm_per_rev * 60.0;
+    const double target_revs = mm_to_revs(home_revs(status), c.position_mm);
+    // The motor is a client through viam-server, so its go_to is a separate RPC that cancelling this
+    // one never reaches. Block on it from another thread and watch this RPC here, where its context
+    // lives; a cancel becomes the motor's stop, which decelerates rather than cutting torque.
+    auto move = std::async(std::launch::async, [&] { motor_->go_to(rpm, target_revs, extra); });
+    while (move.wait_for(std::chrono::milliseconds(10)) != std::future_status::ready) {
+        if (rpc_cancelled()) {
+            stop(extra);
+            try {
+                move.get();  // the motor's go_to returns once the halt lands; its "stopped" error is expected
+            } catch (const std::exception&) {
+            }
+            throw Error("gantry: move cancelled by the caller, decelerated to a stop");
+        }
+    }
+    move.get();
 }
 
 // The motor owns the procedure, so the axis only asks for it: the position the drive ended the run
