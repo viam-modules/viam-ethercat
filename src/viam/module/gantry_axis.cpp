@@ -223,8 +223,7 @@ std::vector<GeometryConfig> GantryAxis::get_geometries(const ProtoStruct& /*extr
     return {};
 }
 
-KinematicModel GantryAxis::get_kinematic_model(const kinematics_options& /*options*/,
-                                               const ProtoStruct& /*extra*/) {
+KinematicModel GantryAxis::get_kinematic_model(const kinematics_options& /*options*/, const ProtoStruct& /*extra*/) {
     return {};
 }
 
