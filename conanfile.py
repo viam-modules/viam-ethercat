@@ -36,7 +36,7 @@ class ethercat(ConanFile):
         # the SDK release was built with, which conan.lock pins. If you bump the
         # SDK here, regenerate conan.lock from that release's lockfile (see README)
         # and update `bin/setup.sh`, CMakeLists.txt, and the Dockerfile to match.
-        self.requires("viam-cpp-sdk/0.44.0")
+        self.requires("viam-cpp-sdk/0.46.0")
         self.requires("boost/[>=1.74.0]")
         # SOEM is NOT a Conan dependency: it is pinned by exact commit SHA and
         # fetched at configure time (see cmake/soem.cmake), so the recipe needs

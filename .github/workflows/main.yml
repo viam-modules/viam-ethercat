@@ -122,7 +122,7 @@ jobs:
     # profile. Pinned to a dated tag so the release toolchain only changes
     # deliberately; keep etc/conan/linux.profile and the README in sync when
     # bumping it.
-    container: ghcr.io/viamrobotics/cpp-sdk-conan-ubuntu:noble-2026-11.00
+    container: ghcr.io/viamrobotics/cpp-sdk-conan-ubuntu:noble-2026-11.02
     steps:
       - name: Checkout
         uses: actions/checkout@v4
