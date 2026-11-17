@@ -37,9 +37,8 @@ VIAM_ETHERCAT_VERSION=$(conan inspect -vquiet ${REPO_ROOT} --format=json | pytho
 
 # Build the viam-ethercat module
 #
-# We want a static binary, so we turn off shared. Elect for C++20
-# compilation for our package only; dependencies stay on the profile's C++17
-# so their package IDs match the published binaries.
+# We want a static binary, so we turn off shared. C++20 comes from the profile,
+# which matches the standard the published binaries were built with.
 
 # We could just call `build` here with `--build=missing`, but we split this into two steps
 # so we can ensure that all our dependencies are built consistently in `Release`, but that
@@ -53,7 +52,6 @@ conan install ${REPO_ROOT} --update \
       --lockfile=${LOCKFILE} \
       --build=missing \
       -s:a "viam-cpp-sdk/*:build_type=RelWithDebInfo" \
-      -s:a "&:compiler.cppstd=20" \
       -o:a "*:shared=False" \
       -o:a "&:shared=False" \
       -o:a "boost/*:without_cobalt=True"
@@ -64,7 +62,6 @@ conan create ${REPO_ROOT} \
       --build=viam-ethercat/$VIAM_ETHERCAT_VERSION \
       -s:a "viam-cpp-sdk/*:build_type=RelWithDebInfo" \
       -s:a "&:build_type=RelWithDebInfo" \
-      -s:a "&:compiler.cppstd=20" \
       -o:a "*:shared=False" \
       -o:a "&:shared=False" \
       -o:a "boost/*:without_cobalt=True"
@@ -79,7 +76,6 @@ conan install \
       --deployer-folder=. --deployer-package "&" \
       -s:a "viam-cpp-sdk/*:build_type=RelWithDebInfo" \
       -s:a "&:build_type=RelWithDebInfo" \
-      -s:a "&:compiler.cppstd=20" \
       -o:a "*:shared=False" \
       -o:a "&:shared=False" \
       -o:a "boost/*:without_cobalt=True"

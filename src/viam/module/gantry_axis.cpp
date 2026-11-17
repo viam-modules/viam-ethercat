@@ -223,11 +223,18 @@ std::vector<GeometryConfig> GantryAxis::get_geometries(const ProtoStruct& /*extr
     return {};
 }
 
+KinematicModel GantryAxis::get_kinematic_model(const kinematics_options& /*options*/, const ProtoStruct& /*extra*/) {
+    return {};
+}
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 KinematicsData GantryAxis::get_kinematics(const ProtoStruct& /*extra*/) {
     if (attrs_.kinematics.empty()) {
         return KinematicsDataUnspecified{};
     }
     return KinematicsDataSVA{attrs_.kinematics};
 }
+#pragma GCC diagnostic pop
 
 }  // namespace ethercat::servo

@@ -63,7 +63,13 @@ class GantryAxis final : public Gantry {
     void stop(const ProtoStruct& extra) override;
     ProtoStruct do_command(const ProtoStruct& command) override;
     std::vector<GeometryConfig> get_geometries(const ProtoStruct& extra) override;
+    // Empty: the RDK reads the typed model only when it has links or joints, and otherwise falls
+    // back to the raw SVA bytes from get_kinematics, so the kinematics_file keeps working as-is.
+    KinematicModel get_kinematic_model(const kinematics_options& options, const ProtoStruct& extra) override;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     KinematicsData get_kinematics(const ProtoStruct& extra) override;
+#pragma GCC diagnostic pop
 
    private:
     // Resolve the attributes and the motor dependency. Called from the constructor: the SDK has no
