@@ -1497,9 +1497,8 @@ void ServoController::select_drive_mode(Cia402Mode mode) {
 }
 
 // Park until the RT loop leaves Homing. Same wake protocol as await_move: no clock, the timeout is
-// the RT loop's own cycle bound. With a cancel probe set it polls instead, as await_move does.
+// the RT loop's own cycle bound.
 bool ServoController::await_homing() {
-    auto give_up = std::chrono::steady_clock::time_point::max();
     for (;;) {
         const std::uint64_t seq = wake_seq_.load(std::memory_order_acquire);
         const auto st = static_cast<HomingState>(state_.homing_state.load(std::memory_order_acquire));
@@ -1509,21 +1508,7 @@ bool ServoController::await_homing() {
         if (stopping_.load(std::memory_order_acquire) || rt_exited_.load(std::memory_order_acquire)) {
             throw Error("home: controller stopped / RT loop not alive");
         }
-        if (!cancel_probe_) {
-            wake_seq_.wait(seq, std::memory_order_acquire);
-            continue;
-        }
-        if (cancel_probe_()) {
-            if (give_up == std::chrono::steady_clock::time_point::max()) {
-                give_up = std::chrono::steady_clock::now() + kCancelStopTimeout;
-            } else if (std::chrono::steady_clock::now() >= give_up) {
-                throw Error("home cancelled by the caller, but the homing run did not end -- the axis may still be moving");
-            }
-            // The same halt a stop() sends, and every poll rather than once: a halt drained in the
-            // same cycle as StartHoming is applied before the run starts, and the run would go on.
-            halt();
-        }
-        std::this_thread::sleep_for(kCancelPoll);
+        wake_seq_.wait(seq, std::memory_order_acquire);
     }
 }
 
@@ -1726,13 +1711,6 @@ bool ServoController::home() {
     restore_homing_torque(saved_torque);
     select_drive_mode(commanded_cia402_mode());
     ETHERCAT_LOG_INFO("servo", "slave {}: homing {}", config_.slave_id, attained ? "attained" : homing_error());
-    // After the mode restore, not before: the enable ladder re-energizes only once the drive echoes
-    // the running mode, and rest is judged energized.
-    if (!attained && static_cast<HomingFail>(state_.homing_fail.load(std::memory_order_acquire)) == HomingFail::Cancelled &&
-        cancel_probe_ && cancel_probe_()) {
-        await_standstill(std::chrono::steady_clock::now() + kCancelStopTimeout, "home");
-        throw Error("home cancelled by the caller: the run was ended, and the axis is at rest");
-    }
     return attained;
 }
 

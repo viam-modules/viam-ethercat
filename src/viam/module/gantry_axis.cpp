@@ -195,8 +195,8 @@ void GantryAxis::await_rest(std::chrono::steady_clock::time_point deadline, cons
     for (;;) {
         bool at_rest = false;
         try {
-            // The motor's own verdict; is_moving alone reads false for an axis that is coasting
-            // de-energized, which is how a stop during homing leaves it until it re-enables.
+            // The motor's own verdict; is_moving alone reads false for an axis coasting de-energized,
+            // as a faulted or disabled drive leaves it.
             at_rest = motor_->get_power_status({}).is_on && !motor_->is_moving();
         } catch (const std::exception& e) {
             throw Error("gantry: " + std::string(what) +
@@ -253,10 +253,10 @@ void GantryAxis::move_to_position(const std::vector<movement_coordinate>& coordi
 // The motor owns the procedure, so the axis only asks for it: the position the drive ended the run
 // at is this axis's zero, whatever back-off the homing method performed, and the motor reports it
 // in its status from then on.
-bool GantryAxis::home(const ProtoStruct& extra) {
+bool GantryAxis::home(const ProtoStruct& /*extra*/) {
     ProtoStruct cmd;
     cmd.emplace("home", ProtoValue(true));
-    const ProtoStruct reply = call_cancellable([motor = motor_, cmd] { return motor->do_command(cmd); }, extra, "home");
+    const ProtoStruct reply = motor_->do_command(cmd);
     const ProtoStruct* const home = nested(reply, "home");
     return home != nullptr && flag(*home, "homed");
 }

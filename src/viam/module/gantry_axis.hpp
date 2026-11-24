@@ -73,9 +73,9 @@ class GantryAxis final : public Gantry {
     KinematicsData get_kinematics(const ProtoStruct& extra) override;
 #pragma GCC diagnostic pop
 
-    // Polled while move_to_position and home wait on the motor: true means this RPC's caller gave
-    // up. Defaults to rpc_cancelled(). A test swaps it, and the wait for rest, to cancel without a
-    // gRPC call.
+    // Polled while move_to_position waits on the motor: true means this RPC's caller gave up.
+    // Defaults to rpc_cancelled(). A test swaps it, and the wait for rest, to cancel without a gRPC
+    // call.
     void set_cancel_probe(std::function<bool()> probe, std::chrono::milliseconds rest_timeout) {
         cancel_probe_ = std::move(probe);
         rest_timeout_ = rest_timeout;

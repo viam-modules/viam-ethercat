@@ -158,7 +158,7 @@ class ServoController : public SlaveControl {
     void go_for(double rpm, double revs);     // PP: relative move; PV: timed run
     void go_to(double rpm, double position);  // PP only (rejects in PV)
     void halt() noexcept;
-    // Polled on the caller's thread while go_to/go_for/home park: true means the caller abandoned
+    // Polled on the caller's thread while go_to/go_for park: true means the caller abandoned
     // the call (its RPC was cancelled). The call then halts, waits for the axis to come to rest, and
     // throws. Unset parks until the call ends. Set before start(); not synchronized against a parked
     // waiter.
@@ -227,8 +227,7 @@ class ServoController : public SlaveControl {
     // Run the drive's homing procedure (every parameter from config_.homing) and block until it
     // ends. True when the drive attained home; false when it reported a homing error, timed out, or
     // the run was cancelled (homing_error() says which). Throws when the config has no method, when
-    // the drive refuses one of the objects, or from a state that cannot home. A caller that cancels
-    // (set_cancel_probe) ends the run the way halt() does and gets an error once the axis is at rest.
+    // the drive refuses one of the objects, or from a state that cannot home.
     bool home();
     // The non-volatile object a drive applies to its reported position at power-on. No CiA402
     // object standardises an encoder origin, so the base has none and only a drive-specific

@@ -60,7 +60,7 @@ std::string temp_file(const std::string& contents) {
 
 // The motor as the gantry sees it over RPC: it passes the describe probe, and its stop() either
 // works or fails the way a call to a motor the RDK has already removed does. With `travelling`
-// set, go_to and the home do_command block, as on a drive mid-travel, until a stop arrives.
+// set, go_to blocks, as on a drive mid-travel, until a stop arrives.
 class FakeMotor final : public Motor {
    public:
     FakeMotor() : Motor("x-motor") {}
@@ -98,13 +98,6 @@ class FakeMotor final : public Motor {
             status.emplace("homed", ProtoValue(true));
             status.emplace("home_revolutions", ProtoValue(home_revolutions));
             reply.emplace("status", ProtoValue(std::move(status)));
-            return reply;
-        }
-        if (command.find("home") != command.end()) {
-            travel();
-            ProtoStruct home;
-            home.emplace("homed", ProtoValue(!stopped));
-            reply.emplace("home", ProtoValue(std::move(home)));
             return reply;
         }
         ProtoStruct describe;
@@ -237,17 +230,6 @@ TEST("a cancelled move stops the motor and returns only once the axis is at rest
     motor->travelling = true;
     motor->ramp_polls = 5;
     CHECK_THROWS_MSG(axis.move_to_position({{80.0, 10.0}}, {}), Error, "cancelled by the caller: the motor stopped, and the axis is at rest");
-    CHECK(motor->stops >= 1);
-    CHECK_EQ(motor->ramp_polls, 0);
-}
-
-TEST("a cancelled home stops the motor and returns only once the axis is at rest") {
-    const auto motor = std::make_shared<FakeMotor>();
-    GantryAxis axis(deps_with(motor), config());
-    axis.set_cancel_probe(cancel_after_polls(3), std::chrono::seconds(5));
-    motor->travelling = true;
-    motor->ramp_polls = 5;
-    CHECK(!axis.home({}));  // the motor's own verdict on a stopped run
     CHECK(motor->stops >= 1);
     CHECK_EQ(motor->ramp_polls, 0);
 }
