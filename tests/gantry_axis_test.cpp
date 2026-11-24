@@ -1,11 +1,15 @@
 // viam:ethercat:gantry without a drive: attribute parsing (and the kinematics file it reads on the
 // way), plus the axis's behaviour against a fake motor where the drive does not matter.
 
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <viam/sdk/common/proto_value.hpp>
@@ -55,13 +59,21 @@ std::string temp_file(const std::string& contents) {
 }
 
 // The motor as the gantry sees it over RPC: it passes the describe probe, and its stop() either
-// works or fails the way a call to a motor the RDK has already removed does.
+// works or fails the way a call to a motor the RDK has already removed does. With `travelling`
+// set, go_to blocks, as on a drive mid-travel, until a stop arrives.
 class FakeMotor final : public Motor {
    public:
     FakeMotor() : Motor("x-motor") {}
 
     int stops = 0;
     bool unreachable = false;
+    bool travelling = false;
+    // Set by stop() and read by the gantry's worker thread, which runs the blocked call.
+    std::atomic<bool> stopped{false};
+    // The blocked call ends normally on a stop, as a move does that arrived just before the halt.
+    bool arrives_on_stop = false;
+    // is_moving() answers true this many more times after a stop: the axis ramping down.
+    int ramp_polls = 0;
     // The drive's frame, as the motor reports it: the axis's zero and where the shaft is now.
     double home_revolutions = 0.0;
     double position_revs = 0.0;
@@ -71,6 +83,12 @@ class FakeMotor final : public Motor {
         ++stops;
         if (unreachable) {
             throw std::runtime_error("Unavailable: motor is being removed");
+        }
+        stopped = true;
+    }
+    void travel() {
+        while (travelling && !stopped) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
     ProtoStruct do_command(const ProtoStruct& command) override {
@@ -92,6 +110,10 @@ class FakeMotor final : public Motor {
     void go_for(double /*rpm*/, double /*revolutions*/, const ProtoStruct& /*extra*/) override {}
     void go_to(double /*rpm*/, double position_revolutions, const ProtoStruct& /*extra*/) override {
         last_go_to_revs = position_revolutions;
+        travel();
+        if (stopped && !arrives_on_stop) {
+            throw std::runtime_error("move aborted (motor stopped)");
+        }
     }
     void set_rpm(double /*rpm*/, const ProtoStruct& /*extra*/) override {}
     void reset_zero_position(double /*offset*/, const ProtoStruct& /*extra*/) override {}
@@ -102,9 +124,13 @@ class FakeMotor final : public Motor {
         return {};
     }
     power_status get_power_status(const ProtoStruct& /*extra*/) override {
-        return {};
+        return {true, 1.0};
     }
     bool is_moving() override {
+        if (stopped && ramp_polls > 0) {
+            --ramp_polls;
+            return true;
+        }
         return false;
     }
     ProtoStruct get_status() override {
@@ -119,6 +145,11 @@ Dependencies deps_with(const std::shared_ptr<FakeMotor>& motor) {
     Dependencies deps;
     deps.emplace(Name(API::from_string("rdk:component:motor"), "", "x-motor"), motor);
     return deps;
+}
+
+// A probe that reports the caller gone after a few polls, so the motor's call is under way first.
+std::function<bool()> cancel_after_polls(int polls) {
+    return [n = 0, polls]() mutable { return ++n > polls; };
 }
 
 }  // namespace
@@ -177,6 +208,40 @@ TEST("stop survives a motor that is already gone, so removal on shutdown cannot 
     motor->unreachable = true;
     axis.stop({});
     CHECK_EQ(motor->stops, 1);
+}
+
+TEST("a cancel whose stop fails returns an error within the timeout instead of hanging") {
+    const auto motor = std::make_shared<FakeMotor>();
+    GantryAxis axis(deps_with(motor), config());
+    axis.set_cancel_probe(cancel_after_polls(3), std::chrono::milliseconds(300));
+    motor->travelling = true;
+    motor->unreachable = true;
+    const auto started = std::chrono::steady_clock::now();
+    CHECK_THROWS_MSG(axis.move_to_position({{80.0, 10.0}}, {}), Error, "its stop failed (Unavailable: motor is being removed)");
+    CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(3));
+    CHECK(motor->stops >= 1);
+    motor->stopped = true;  // let the worker still blocked in the motor's call finish
+}
+
+TEST("a cancelled move stops the motor and returns only once the axis is at rest") {
+    const auto motor = std::make_shared<FakeMotor>();
+    GantryAxis axis(deps_with(motor), config());
+    axis.set_cancel_probe(cancel_after_polls(3), std::chrono::seconds(5));
+    motor->travelling = true;
+    motor->ramp_polls = 5;
+    CHECK_THROWS_MSG(axis.move_to_position({{80.0, 10.0}}, {}), Error, "cancelled by the caller: the motor stopped, and the axis is at rest");
+    CHECK(motor->stops >= 1);
+    CHECK_EQ(motor->ramp_polls, 0);
+}
+
+TEST("a move that arrives as the cancel lands stays a completed move") {
+    const auto motor = std::make_shared<FakeMotor>();
+    GantryAxis axis(deps_with(motor), config());
+    axis.set_cancel_probe(cancel_after_polls(3), std::chrono::seconds(5));
+    motor->travelling = true;
+    motor->arrives_on_stop = true;
+    axis.move_to_position({{80.0, 10.0}}, {});
+    CHECK_EQ(motor->last_go_to_revs, 2.0);
 }
 
 TEST_MAIN()

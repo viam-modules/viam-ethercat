@@ -8,7 +8,9 @@
 // standard motor API plus the module's own do_command contract. It therefore depends on a motor
 // component and never touches the EtherCAT bus itself.
 
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -71,6 +73,14 @@ class GantryAxis final : public Gantry {
     KinematicsData get_kinematics(const ProtoStruct& extra) override;
 #pragma GCC diagnostic pop
 
+    // Polled while move_to_position waits on the motor: true means this RPC's caller gave up.
+    // Defaults to rpc_cancelled(). A test swaps it, and the wait for rest, to cancel without a gRPC
+    // call.
+    void set_cancel_probe(std::function<bool()> probe, std::chrono::milliseconds rest_timeout) {
+        cancel_probe_ = std::move(probe);
+        rest_timeout_ = rest_timeout;
+    }
+
    private:
     // Resolve the attributes and the motor dependency. Called from the constructor: the SDK has no
     // reconfigure hook, so a config change builds a new component.
@@ -100,8 +110,17 @@ class GantryAxis final : public Gantry {
 
     static double home_revs(const ProtoStruct& motor_status);
 
+    // Run a blocking motor call so that cancelling this RPC stops the axis; see the definition.
+    template <class Call>
+    auto call_cancellable(Call call, const ProtoStruct& extra, const char* what);
+    // Poll the motor until it reports the axis energized and not moving; throws, naming `what`, if
+    // that does not happen by `deadline` or the motor cannot be asked.
+    void await_rest(std::chrono::steady_clock::time_point deadline, const char* what);
+
     Attributes attrs_;
     std::shared_ptr<Motor> motor_;
+    std::function<bool()> cancel_probe_;
+    std::chrono::milliseconds rest_timeout_{10'000};
 };
 
 }  // namespace ethercat::servo

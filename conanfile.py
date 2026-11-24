@@ -38,6 +38,9 @@ class ethercat(ConanFile):
         # and update `bin/setup.sh`, CMakeLists.txt, and the Dockerfile to match.
         self.requires("viam-cpp-sdk/0.46.0")
         self.requires("boost/[>=1.74.0]")
+        # The SDK keeps gRPC's headers to itself, but the motor reads its caller's cancellation off
+        # the grpc::ServerContext the SDK hands out, so the headers have to be ours as well.
+        self.requires("grpc/[>=1.48.4]")
         # SOEM is NOT a Conan dependency: it is pinned by exact commit SHA and
         # fetched at configure time (see cmake/soem.cmake), so the recipe needs
         # network access during build. All SOEM knowledge stays in that file.

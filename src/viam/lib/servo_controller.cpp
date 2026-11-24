@@ -45,6 +45,13 @@ constexpr double kStopWindowMarginS = 0.05;
 // Runner's own bring-up bound (120s), so the async-outcome poll never hangs if a signal is missed.
 constexpr unsigned kMaxBringupAttempts = 5;
 constexpr std::chrono::milliseconds kBringupWaitCap{130'000};
+// A cancelled call's patience for the axis to come to rest. Far longer than a halt ramp from full
+// speed takes, so hitting it means the axis is not under control, not that the ramp was slow.
+// ponytail: fixed, not derived from the configured decel; derive it if a very slow ramp is configured.
+constexpr std::chrono::seconds kCancelStopTimeout{10};
+// std::atomic::wait cannot time out to look at the cancel probe, so a cancellable wait polls. On the
+// API thread only; the RT loop never sees it.
+constexpr std::chrono::milliseconds kCancelPoll{10};
 
 ServoConfig validated(ServoConfig config) {
     config.validate();
@@ -1314,7 +1321,69 @@ void ServoController::await_move(std::uint32_t generation) {
             release_motion_slot(g);
             throw Error("move: drive faulted (" + last_error() + ")");
         }
-        wake_seq_.wait(seq, std::memory_order_acquire);  // block until a wake bump (or a spurious wake -> re-check)
+        if (!cancel_probe_) {
+            wake_seq_.wait(seq, std::memory_order_acquire);  // block until a wake bump (or a spurious wake -> re-check)
+            continue;
+        }
+        while (wake_seq_.load(std::memory_order_acquire) == seq) {
+            if (cancel_probe_()) {
+                cancel_move(g);
+                return;
+            }
+            std::this_thread::sleep_for(kCancelPoll);
+        }
+    }
+}
+
+void ServoController::cancel_move(std::uint32_t generation) {
+    const std::uint32_t g = generation;
+    const auto deadline = std::chrono::steady_clock::now() + kCancelStopTimeout;
+    // Halt only once the loop has adopted the move: a halt drained in the same cycle as the move's own
+    // SetTarget is applied before the target, and the move would run on. And only once, since a halt
+    // carries no generation and a second one could land on the next caller's move.
+    bool halted = false;
+    while (!gen_terminal(g) && !stopping_.load(std::memory_order_acquire) && !rt_exited_.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        if (!halted && state_.active_generation.load(std::memory_order_acquire) >= g) {
+            halt();
+            halted = true;
+        }
+        std::this_thread::sleep_for(kCancelPoll);
+    }
+    if (state_.completed_generation.load(std::memory_order_acquire) == g) {
+        return;  // it arrived before the halt reached it: a completed move, not a cancelled one
+    }
+    try {
+        await_standstill(deadline, "move");
+    } catch (...) {
+        release_motion_slot(g);
+        throw;
+    }
+    release_motion_slot(g);
+    throw Error("move cancelled by the caller: halted, and the axis is at rest");
+}
+
+void ServoController::await_standstill(std::chrono::steady_clock::time_point deadline, const char* what) const {
+    for (;;) {
+        // Checked first: once the loop is gone or the drive faulted, the published moving flag is
+        // stale or forced false and says nothing about the shaft.
+        if (stopping_.load(std::memory_order_acquire) || rt_exited_.load(std::memory_order_acquire) ||
+            state_.faulted.load(std::memory_order_acquire)) {
+            throw Error(std::string(what) +
+                        " cancelled by the caller, but the controller stopped or the drive faulted before the axis came to rest (" +
+                        last_error() + ") -- it may still be moving");
+        }
+        // The loop's own rest verdict: energized, nothing commanded in motion, and the position steady
+        // over its window. The caller saw the halt land first, so a value read here was published no
+        // earlier than the cycle before it, while the axis was still commanded to move.
+        if (state_.powered.load(std::memory_order_acquire) && !state_.moving.load(std::memory_order_acquire)) {
+            return;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw Error(std::string(what) + " cancelled by the caller, but the axis did not come to rest within " +
+                        std::to_string(kCancelStopTimeout.count()) + " s -- it may still be moving");
+        }
+        std::this_thread::sleep_for(kCancelPoll);
     }
 }
 

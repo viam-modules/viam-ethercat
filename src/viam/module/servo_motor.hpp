@@ -97,4 +97,9 @@ class ServoMotor final : public Motor {
     std::atomic<double> abs_enc_mode_{0.0};
 };
 
+// True when the RPC this thread is serving was cancelled by its caller. The SDK passes a resource
+// no context, but publishes the in-flight call's server context thread-locally; false off an RPC
+// thread (tests, the RT loop).
+bool rpc_cancelled();
+
 }  // namespace ethercat::servo
