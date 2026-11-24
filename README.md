@@ -5,12 +5,13 @@ CiA402 servo drives. The module runs a phase-locked 1 kHz real-time loop with
 Distributed-Clocks (SYNC0) support and exposes the standard Viam motor API
 (`go_to`, `go_for`, `set_rpm`, `stop`, …) in output revolutions.
 
-Two motor models ship in one module:
+Three motor models and a gantry model ship in one module:
 
 | Model | Use for |
 |---|---|
 | `viam:ethercat:servo` | any conformant CiA402 EtherCAT servo drive |
 | `viam:ethercat:a6-servo` | ANCTL A6-EC series drives (adds the A6's vendor fault-reset, sync-fault code, and position-stability move-completion, since the A6 ties statusword bit 10 high) |
+| `viam:ethercat:yaskawa-servo` | Yaskawa Sigma-X (SGDXS) drives (pins the drive's user-unit ratios, defaults to `profile`, and can read the hardwired safety chain through `safety_inputs`; see [Yaskawa Sigma-X servo](#yaskawa-sigma-x-servo)) |
 | `viam:ethercat:gantry` | one linear axis driven by one of the motors above (`rdk:component:gantry`) |
 
 ## Requirements
@@ -33,11 +34,11 @@ Add a motor component with one of the models above.
 | Name | Type | Inclusion | Default | Description |
 |------|------|-----------|---------|-------------|
 | `interface` | string | **Required** | — | EtherCAT NIC name (e.g. `enp3s0`). |
-| `max_rpm` | float | **Required** | — | Motor speed clamp (nameplate rated speed). |
+| `max_rpm` | float | **Required** | — | Clamp on commanded speed. Like the rest of the motor API it is in output revolutions, so it equals the motor's nameplate speed only when `gear_ratio` is `1`. |
 | `counts_per_rev` | float | **Required** | — | Encoder counts per motor revolution. |
 | `motor_rated_current_amps` | float | **Required** | — | Nameplate rated current. |
 | `slave` | int | Optional | `1` | 1-based position of the drive on the bus. |
-| `control_mode` | string | Optional | `csp` (`profile` for `a6-servo`) | `csp`: cyclic synchronous position, master-side trajectory, needs `use_distributed_clocks`. `profile`: PP for `go_to`/`go_for`, PV for `set_rpm`, the drive generates the trajectory. |
+| `control_mode` | string | Optional | `csp` (`profile` for `a6-servo` and `yaskawa-servo`) | `csp`: cyclic synchronous position, master-side trajectory, needs `use_distributed_clocks`. `profile`: PP for `go_to`/`go_for`, PV for `set_rpm`, the drive generates the trajectory. |
 | `gear_ratio` | float | Optional | `1.0` | Motor revolutions per output revolution. |
 | `position_tolerance_counts` | int | Optional | `counts_per_rev`/720 | "Reached/stopped" stability band. |
 | `loop_rate_hz` | int | Optional | `1000` | Cycle rate (1..1000). |
@@ -46,7 +47,7 @@ Add a motor component with one of the models above.
 | `require_realtime` | bool | Optional | `true` | Hard-fail at load without SCHED_FIFO. |
 | `rt_priority` | int | Optional | `80` | SCHED_FIFO priority (1..99). |
 | `max_acceleration_rpm_per_s` | float | Optional | `max_rpm` per second | Ramp acceleration of the master-side trajectory in `csp`; ignored in `profile`. |
-| `quick_stop_decel_rpm_per_s` | float | Optional | `0` (not configured) | Deceleration written to the drive's 0x6085: its quick stop, its E-stop input ramp, and in `profile` mode the module's own `stop()`; in `profile` mode the drive must hold 0x605A = 2. |
+| `quick_stop_decel_rpm_per_s` | float | Optional | `0` (not configured) | Deceleration written to the drive's 0x6085: its quick stop, its E-stop input ramp, and the ramp the module uses when it shuts down or is reconfigured mid-move; in `profile` mode the drive must hold 0x605A = 2. Left at `0`, a shutdown mid-move removes drive power and the axis coasts. `stop()` does not use this ramp, see [Behavior notes](#behavior-notes). |
 | `emergency_stop_fault_code` | string or int | Optional | none | 0x603F value the drive reports while its emergency-stop input is engaged (e.g. `"0xFF3A"`). While present, `status` reports `emergency_stop: true`, motion calls fail with "emergency stop engaged", and no automatic fault-reset edges are sent (the `fault_reset` do_command still works, for a drive that latches the stop). |
 | `absolute_encoder` | object | Optional | none | Declares the drive object that says the encoder retains position, and the 0x603F codes that mean it lost it: `{"index": "0x2A9C", "sub": 4, "type": "u16", "equals": 2, "invalid_codes": ["0xFF3C", "0xFF3D", "0xFF0F"]}`. Read by the `is_abs_enc_valid` verb and by `homed`. |
 | `homing` | object | Optional | none | Everything one homing run needs; without it `home` is refused. See [Homing](#homing). |
@@ -109,6 +110,36 @@ matter:
 }
 ```
 
+### Yaskawa Sigma-X servo
+
+`viam:ethercat:yaskawa-servo` takes the attributes above plus `safety_inputs`.
+
+The drive scales every reference object through its user-unit ratios, and the model pins position
+and velocity (2701h, 2702h) at 64/1. One count is therefore 64 encoder increments, so set
+`counts_per_rev` to the encoder's increments per revolution divided by 64: `1048576` for a 26-bit
+encoder, `262144` for a 24-bit one. A value copied from a drive with a different encoder gives a
+scale error.
+
+`safety_inputs` declares which bits of the drive's digital inputs (0x60FD) carry the hardwired
+safety chain. Which pin lands on which bit, and which level means safe, is wiring, so both are
+declared and never inferred:
+
+```json
+"safety_inputs": {
+  "quick_stop": {"require_high_bits": [19]},
+  "stop": {"require_low_bits": [20]}
+}
+```
+
+| Name | Type | Inclusion | Description |
+|------|------|-----------|-------------|
+| `quick_stop` | object | Optional | While any `require_high_bits` bit reads 0 or any `require_low_bits` bit reads 1, the module holds CiA402 quick stop: the drive ramps at 0x6085 while it still has power. |
+| `stop` | object | Optional | Same shape; while engaged the module holds CiA402 Shutdown, for a chain that has already removed torque. |
+
+A tier that is not declared never engages. Without `safety_inputs` the module cannot tell a
+safety-chain trip from any other reason the drive left Operation Enabled, and a move in flight
+waits until the drive returns or `stop` is called.
+
 ### Homing
 
 One `homing` object holds everything a run needs, so `home` takes no arguments and a dependent
@@ -129,6 +160,9 @@ component (the gantry) configures nothing about it:
 |------|------|-----------|---------|-------------|
 | `method` | int | **Required** | — | The 0x6098 homing method. CiA402 leaves the negative methods to the manufacturer, so they differ per drive and cannot be defaulted: the A6-EC homes into a hard stop with -1 (reverse) and -2 (forward), an Applied Motion M56S with -4 and -3. The drive is asked for it and the value is read back, so a method it does not support fails the `home` call before anything moves. |
 | `speed_rpm` | float | **Required** | — | Approach speed, written to 0x6099:01. |
+| `zero_speed_rpm` | float | Optional | `0` (the drive's own) | Index-pulse search speed, written to 0x6099:02. |
+| `offset_counts` | int | Optional | `0` (the drive's own) | Home offset in counts, written to 0x607C. |
+| `save_zero_after_home` | bool | Optional | `true` | Save the encoder zero the run found, so a drive with an absolute encoder keeps the reference across a restart. |
 | `acceleration_rpm_per_s` | float | Optional | `0` (the drive's own) | Written to 0x609A. |
 | `torque_object` | object | Optional | none | Drive object that bounds motor current during the run, and so sets the contact threshold for a hard-stop method: `{"index", "sub", "type", "units_per_percent"}`. The type and scale are the drive's own -- read the object first, a wrong width is refused. A limit-switch method (1, 2, 17, 18, …) needs none. |
 | `torque_percent` | float | Optional | `0` (the drive's own) | Contact threshold in percent of rated current; needs `torque_object`. The object is saved before the run and written back after it, so a drive whose only torque limit is the global one is not left clamped. |
@@ -148,7 +182,14 @@ bus drops, since a drive that lost control power may have lost a battery-backed 
 ### Behavior notes
 
 - `stop()` is a CiA402 Halt: the motor ramps to standstill and **holds position
-  energized**. Use the `disable` do_command to de-energize (coast).
+  energized**. Use the `disable` do_command to de-energize (coast). In `profile` mode the ramp is
+  the drive's own halt ramp (0x605D selects it, normally the profile deceleration 0x6084), which
+  the module does not write; in `csp` it is the master-side ramp at `max_acceleration_rpm_per_s`.
+  `stop()` returns once the halt is commanded, not once the axis is at rest.
+- In `profile` mode a move is complete when the drive reports target reached (statusword bit 10).
+  The window behind that bit is the drive's 0x6067 and 0x6068, which the module does not write.
+- Cancelling a `go_to` or `go_for` call from the client does not stop the move: it runs to its
+  target, and new moves are refused until it ends. Call `stop()` to end it early.
 - A drive fault is recovered the standard CiA402 way: the module presents fault-reset edges
   (controlword bit 7) every `fault_reset_window_cycles` until the drive leaves Fault, then re-enables.
   `last_error` names the fault code meanwhile; the `fault_reset` do_command requests an edge at once.
@@ -196,7 +237,7 @@ zero and no run is needed.
 |------|------|-----------|---------|-------------|
 | `motor` | string | **Required** | — | Name of the axis motor (also list it in `depends_on`). |
 | `length_mm` | float | **Required** | — | Travel length of the axis, measured from the home reference. |
-| `mm_per_rev` | float | **Required** | — | Linear travel per motor revolution. |
+| `mm_per_rev` | float | **Required** | — | Linear travel per revolution of the motor component, which counts output revolutions: per motor shaft revolution only when the motor's `gear_ratio` is `1`. |
 | `gantry_mm_per_sec` | float | Optional | `0` | Default speed when a move does not give one. |
 | `travel_direction` | string | Optional | `positive` | Which way motor revolutions run as the axis travels away from its home end. Set it to `negative` when homing moves the motor in the positive direction. |
 | `kinematics_file` | string | Optional | — | Path to an SVA kinematics JSON file on the machine, served to the frame system as is. |
@@ -226,7 +267,8 @@ it moves with the carriage, and motion planning cannot drive it. Point it at a
 with one prismatic joint; the module serves the file unchanged and the RDK builds the model.
 The file must exist when the component is configured, and its joint must match the axis: `min`
 of `0` and `max` equal to `length_mm`, since the gantry's millimetre position is the joint value,
-and `axis` set to the real travel direction, which is described nowhere else.
+and `axis` set to the real travel direction, which is described nowhere else. The module does
+not check the file against `length_mm`.
 
 ```json
 {
