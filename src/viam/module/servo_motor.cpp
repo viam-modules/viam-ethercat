@@ -16,8 +16,10 @@
 #include <utility>
 #include <vector>
 
+#include <grpcpp/server_context.h>
 #include <viam/sdk/common/proto_value.hpp>
 #include <viam/sdk/log/logging.hpp>
+#include <viam/sdk/rpc/grpc_context_observer.hpp>
 
 #include "ethercat/cia402.hpp"
 #include "ethercat/errors.hpp"
@@ -504,6 +506,7 @@ std::vector<std::string> ServoMotor::validate(const ResourceConfig& cfg, etherca
 ServoMotor::ServoMotor(const Dependencies& /*deps*/, const ResourceConfig& cfg)
     : Motor(cfg.name()), log_sink_(std::make_shared<SdkLogSink>(*this)), controller_(build_controller<ServoController>(cfg)) {
     install_logging(cfg.get_log_level());
+    controller_->set_cancel_probe(rpc_cancelled);
     controller_->start();
 }
 
@@ -513,6 +516,7 @@ ServoMotor::ServoMotor(std::string name, std::unique_ptr<ServoController> contro
         throw Error("ServoMotor: null controller");
     }
     install_logging(viam::sdk::log_level::info);
+    controller_->set_cancel_probe(rpc_cancelled);
     controller_->start();
 }
 
@@ -794,6 +798,11 @@ ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
 
 std::vector<GeometryConfig> ServoMotor::get_geometries(const ProtoStruct& /*extra*/) {
     return {};  // a bare motor has no geometry
+}
+
+bool rpc_cancelled() {
+    const auto& observer = viam::sdk::GrpcContextObserver::current();
+    return observer && observer->context().IsCancelled();
 }
 
 }  // namespace ethercat::servo

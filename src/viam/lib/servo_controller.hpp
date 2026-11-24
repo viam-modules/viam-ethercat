@@ -158,6 +158,13 @@ class ServoController : public SlaveControl {
     void go_for(double rpm, double revs);     // PP: relative move; PV: timed run
     void go_to(double rpm, double position);  // PP only (rejects in PV)
     void halt() noexcept;
+    // Polled on the caller's thread while go_to/go_for/home park: true means the caller abandoned
+    // the call (its RPC was cancelled). The call then halts, waits for the axis to come to rest, and
+    // throws. Unset parks until the call ends. Set before start(); not synchronized against a parked
+    // waiter.
+    void set_cancel_probe(std::function<bool()> probe) {
+        cancel_probe_ = std::move(probe);
+    }
     // Set the software zero so the current actual reads `offset_revs` (default 0). A non-zero
     // offset reads config_ and takes the shared lock; offset 0 is the common stop/zero case.
     void set_zero(double offset_revs = 0.0) noexcept;
@@ -220,7 +227,8 @@ class ServoController : public SlaveControl {
     // Run the drive's homing procedure (every parameter from config_.homing) and block until it
     // ends. True when the drive attained home; false when it reported a homing error, timed out, or
     // the run was cancelled (homing_error() says which). Throws when the config has no method, when
-    // the drive refuses one of the objects, or from a state that cannot home.
+    // the drive refuses one of the objects, or from a state that cannot home. A caller that cancels
+    // (set_cancel_probe) ends the run the way halt() does and gets an error once the axis is at rest.
     bool home();
     // The non-volatile object a drive applies to its reported position at power-on. No CiA402
     // object standardises an encoder origin, so the base has none and only a drive-specific
@@ -435,6 +443,7 @@ class ServoController : public SlaveControl {
     // Non-RT-readable teardown signal (separate from the jthread stop_token): drives the
     // go_to/go_for wait predicate and the accessors' fail-safe.
     std::atomic<bool> stopping_{false};
+    std::function<bool()> cancel_probe_;             // see set_cancel_probe
     std::jthread recovery_;                          // retries the rebuild while bus_lost_; joined by stop() before the lock
     std::atomic<std::uint32_t> next_generation_{0};  // non-RT: assigns unique move ids
     // Single-in-flight slot: the generation of the active blocking move (go_to/go_for), or 0 for
@@ -505,7 +514,15 @@ class ServoController : public SlaveControl {
     // Park on generation `g`'s completion (no timeout: a C++20 atomic wait on wake_seq_,
     // lost-wakeup-immune via the seq re-check), then classify the wake and throw on stop/abort/fault.
     // Shared by go_to (absolute) and go_for (relative) so both get identical semantics.
+    // With a cancel probe set, polls it instead and hands a cancel to cancel_move.
     void await_move(std::uint32_t generation);
+    // The caller of move `generation` gave up: halt it, wait for rest, and throw -- or return when
+    // the move completed before the halt reached it.
+    void cancel_move(std::uint32_t generation);
+    // Block until the RT loop reports the axis energized and at rest, polling. Throws, naming
+    // `what`, when the deadline passes or the controller or drive goes down first: either way the
+    // axis may still be moving.
+    void await_standstill(std::chrono::steady_clock::time_point deadline, const char* what) const;
     // Single-in-flight slot (non-RT / API thread). gen_terminal: has this move reached a terminal
     // (completed or failed) state? try_claim_motion_slot: CAS the slot to `gen`, reclaiming it only
     // if free or holding a terminal gen, and returning false if a live blocking move owns it.

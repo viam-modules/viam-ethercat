@@ -249,7 +249,10 @@ if (ETHERCAT_BUILD_MODULE)
   # The component models, apart from the entrypoint, so a test can link them without a module
   # process. Whatever links them includes the SDK headers, so their build flags are PUBLIC.
   add_library(ethercat-servo-models STATIC src/viam/module/gantry_axis.cpp src/viam/module/servo_motor.cpp)
-  target_link_libraries(ethercat-servo-models PUBLIC ethercat viam-cpp-sdk::viamapi viam-cpp-sdk::viamsdk)
+  # gRPC for the grpc::ServerContext the motor reads its caller's cancellation from. Found through
+  # the SDK's own config; a system install that has no gRPC target serves the headers from the
+  # default include path instead.
+  target_link_libraries(ethercat-servo-models PUBLIC ethercat viam-cpp-sdk::viamapi viam-cpp-sdk::viamsdk $<TARGET_NAME_IF_EXISTS:gRPC::grpc++>)
   viam_apply_wall_werror(ethercat-servo-models)
   # Tell boost::dll to use std::filesystem rather than boost::filesystem.
   target_compile_definitions(ethercat-servo-models PUBLIC BOOST_DLL_USE_STD_FS)

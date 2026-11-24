@@ -149,6 +149,12 @@ bus drops, since a drive that lost control power may have lost a battery-backed 
 
 - `stop()` is a CiA402 Halt: the motor ramps to standstill and **holds position
   energized**. Use the `disable` do_command to de-energize (coast).
+- Cancelling a `go_to`, `go_for` or `home` call from the client (or dropping the connection) stops
+  the axis the way `stop()` does, and the call returns its cancellation error only once the axis is
+  at rest -- or, after 10 s, an error saying it may still be moving. A `stop()` during homing,
+  cancelled or explicit, de-energizes the drive until the enable ladder re-energizes it, so the
+  axis coasts meanwhile. The gantry's `move_to_position` and `home` turn a cancel into the motor's
+  `stop` and wait for rest the same way.
 - A drive fault is recovered the standard CiA402 way: the module presents fault-reset edges
   (controlword bit 7) every `fault_reset_window_cycles` until the drive leaves Fault, then re-enables.
   `last_error` names the fault code meanwhile; the `fault_reset` do_command requests an edge at once.

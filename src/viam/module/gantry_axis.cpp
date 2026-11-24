@@ -1,9 +1,12 @@
 #include "viam/module/gantry_axis.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 #include <viam/sdk/log/logging.hpp>
@@ -21,6 +24,11 @@ using attrs::nested;
 using attrs::opt_num;
 
 namespace {
+
+// How often a waiting call looks at its own RPC, and at the motor while waiting for rest.
+constexpr std::chrono::milliseconds kCancelPoll{10};
+// How long a cancel gives each stop to end the motor's call before it sends another.
+constexpr std::chrono::milliseconds kStopRetry{100};
 
 // The whole file, unparsed: the RDK builds the frame-system model from it. Only what would otherwise
 // surface as an opaque planner error later is checked here.
@@ -86,7 +94,7 @@ std::shared_ptr<ModelRegistration> GantryAxis::create_model_registration() {
         [](const ResourceConfig& cfg) { return GantryAxis::validate(cfg); });
 }
 
-GantryAxis::GantryAxis(const Dependencies& deps, const ResourceConfig& cfg) : Gantry(cfg.name()) {
+GantryAxis::GantryAxis(const Dependencies& deps, const ResourceConfig& cfg) : Gantry(cfg.name()), cancel_probe_(rpc_cancelled) {
     configure(deps, cfg);
 }
 
@@ -140,6 +148,72 @@ double GantryAxis::home_revs(const ProtoStruct& motor_status) {
     return opt_num(motor_status, "home_revolutions", 0.0);
 }
 
+// The motor is a client through viam-server, so its blocking calls are separate RPCs that cancelling
+// this one never reaches. Run `call` on its own thread and watch this RPC here, where its context
+// lives: a cancel becomes the motor's stop, and returns only once the axis is at rest. `call` must
+// own everything it touches, since it can outlive this frame.
+template <class Call>
+auto GantryAxis::call_cancellable(Call call, const ProtoStruct& extra, const char* what) {
+    std::packaged_task<decltype(call())()> task(std::move(call));
+    auto done = task.get_future();
+    // Detached rather than std::async, whose future blocks in its destructor until the call returns:
+    // a motor that never answers would then hang this RPC on its way out of an error.
+    std::thread(std::move(task)).detach();
+    while (done.wait_for(kCancelPoll) != std::future_status::ready) {
+        if (!cancel_probe_()) {
+            continue;
+        }
+        const auto deadline = std::chrono::steady_clock::now() + rest_timeout_;
+        std::string stop_error;
+        // Stop until the motor's call has ended, not once: a stop that reaches the motor before the
+        // call it is meant for stops nothing, and that call then runs to its end.
+        do {
+            try {
+                motor_->stop(extra);
+                stop_error.clear();
+            } catch (const std::exception& e) {
+                stop_error = e.what();
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                throw Error("gantry: " + std::string(what) + " cancelled by the caller, but the motor's call did not end" +
+                            (stop_error.empty() ? std::string() : " and its stop failed (" + stop_error + ")") +
+                            " -- the axis may still be moving");
+            }
+        } while (done.wait_for(kStopRetry) != std::future_status::ready);
+        await_rest(deadline, what);
+        try {
+            return done.get();  // the call ended on its own before the stop reached it: its result stands
+        } catch (const std::exception& e) {
+            throw Error("gantry: " + std::string(what) + " cancelled by the caller: the motor stopped, and the axis is at rest (" +
+                        e.what() + ")");
+        }
+    }
+    return done.get();
+}
+
+void GantryAxis::await_rest(std::chrono::steady_clock::time_point deadline, const char* what) {
+    for (;;) {
+        bool at_rest = false;
+        try {
+            // The motor's own verdict; is_moving alone reads false for an axis that is coasting
+            // de-energized, which is how a stop during homing leaves it until it re-enables.
+            at_rest = motor_->get_power_status({}).is_on && !motor_->is_moving();
+        } catch (const std::exception& e) {
+            throw Error("gantry: " + std::string(what) +
+                        " cancelled by the caller, but the motor cannot say whether the axis is at rest (" + e.what() +
+                        ") -- it may still be moving");
+        }
+        if (at_rest) {
+            return;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw Error("gantry: " + std::string(what) + " cancelled by the caller, but the axis did not come to rest within " +
+                        std::to_string(rest_timeout_.count()) + " ms -- it may still be moving");
+        }
+        std::this_thread::sleep_for(kCancelPoll);
+    }
+}
+
 std::vector<double> GantryAxis::get_position(const ProtoStruct& extra) {
     const ProtoStruct status = motor_status();
     if (!flag(status, "homed")) {
@@ -171,16 +245,18 @@ void GantryAxis::move_to_position(const std::vector<movement_coordinate>& coordi
     }
     // The motor takes a signed revolution target and an unsigned speed; the sign of the target
     // carries the direction, so the speed is a magnitude in rpm.
-    motor_->go_to(speed / attrs_.mm_per_rev * 60.0, mm_to_revs(home_revs(status), c.position_mm), extra);
+    const double rpm = speed / attrs_.mm_per_rev * 60.0;
+    const double revs = mm_to_revs(home_revs(status), c.position_mm);
+    call_cancellable([motor = motor_, rpm, revs, extra] { motor->go_to(rpm, revs, extra); }, extra, "move");
 }
 
 // The motor owns the procedure, so the axis only asks for it: the position the drive ended the run
 // at is this axis's zero, whatever back-off the homing method performed, and the motor reports it
 // in its status from then on.
-bool GantryAxis::home(const ProtoStruct& /*extra*/) {
+bool GantryAxis::home(const ProtoStruct& extra) {
     ProtoStruct cmd;
     cmd.emplace("home", ProtoValue(true));
-    const ProtoStruct reply = motor_->do_command(cmd);
+    const ProtoStruct reply = call_cancellable([motor = motor_, cmd] { return motor->do_command(cmd); }, extra, "home");
     const ProtoStruct* const home = nested(reply, "home");
     return home != nullptr && flag(*home, "homed");
 }
